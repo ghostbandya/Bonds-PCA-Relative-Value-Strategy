@@ -1,0 +1,45 @@
+ticker,country,tenor,root,exchange,generic_n
+TU1 Comdty,US,2y,TU,CBT,1
+TU2 Comdty,US,2y,TU,CBT,2
+3Y1 Comdty,US,3y,3Y,CBT,1
+3Y2 Comdty,US,3y,3Y,CBT,2
+FV1 Comdty,US,5y,FV,CBT,1
+FV2 Comdty,US,5y,FV,CBT,2
+TY1 Comdty,US,10y,TY,CBT,1
+TY2 Comdty,US,10y,TY,CBT,2
+UXY1 Comdty,US,Ultra 10y,UXY,CBT,1
+UXY2 Comdty,US,Ultra 10y,UXY,CBT,2
+US1 Comdty,US,Long Bond,US,CBT,1
+US2 Comdty,US,Long Bond,US,CBT,2
+WN1 Comdty,US,Ultra Bond,WN,CBT,1
+WN2 Comdty,US,Ultra Bond,WN,CBT,2
+DU1 Comdty,Germany,Schatz 2y,DU,Eurex,1
+DU2 Comdty,Germany,Schatz 2y,DU,Eurex,2
+OE1 Comdty,Germany,Bobl 5y,OE,Eurex,1
+OE2 Comdty,Germany,Bobl 5y,OE,Eurex,2
+RX1 Comdty,Germany,Bund 10y,RX,Eurex,1
+RX2 Comdty,Germany,Bund 10y,RX,Eurex,2
+UB1 Comdty,Germany,Buxl 30y,UB,Eurex,1
+UB2 Comdty,Germany,Buxl 30y,UB,Eurex,2
+WB1 Comdty,UK,Short Gilt,WB,ICE,1
+WB2 Comdty,UK,Short Gilt,WB,ICE,2
+G 1 Comdty,UK,Long Gilt,G,ICE,1
+G 2 Comdty,UK,Long Gilt,G,ICE,2
+JB1 Comdty,Japan,JGB 10y,JB,OSE,1
+JB2 Comdty,Japan,JGB 10y,JB,OSE,2
+JM1 Comdty,Japan,JGB Mini,JM,OSE,1
+JM2 Comdty,Japan,JGB Mini,JM,OSE,2
+CV1 Comdty,Canada,CGZ 2y,CV,MX,1
+CV2 Comdty,Canada,CGZ 2y,CV,MX,2
+CN1 Comdty,Canada,CGB 10y,CN,MX,1
+CN2 Comdty,Canada,CGB 10y,CN,MX,2
+LB1 Comdty,Canada,LGB 30y,LB,MX,1
+LB2 Comdty,Canada,LGB 30y,LB,MX,2
+YM1 Comdty,Australia,3y,YM,ASX,1
+YM2 Comdty,Australia,3y,YM,ASX,2
+XM1 Comdty,Australia,10y,XM,ASX,1
+XM2 Comdty,Australia,10y,XM,ASX,2
+YXT1 Comdty,Australia,20y,YXT,ASX,1
+YXT2 Comdty,Australia,20y,YXT,ASX,2
+SWG1 Comdty,Switzerland,CONF 10y,SWG,Eurex,1
+SWG2 Comdty,Switzerland,CONF 10y,SWG,Eurex,2
