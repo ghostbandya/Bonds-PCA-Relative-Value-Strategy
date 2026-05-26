@@ -1,7 +1,6 @@
 # Applied Quantitative Macro Strategies
 ## PCA-Based Sovereign Bond Mean-Reversion + Carry/Roll-Down
 
-**Imperial College London — MSc Applied Quantitative Macro Strategies**
 
 ---
 
