@@ -36,6 +36,13 @@ os.makedirs(YIELD_DIR, exist_ok=True)
 
 DEFAULT_START = "2000-01-01"
 DEFAULT_END   = datetime.today().strftime("%Y-%m-%d")
+
+# The seven common tenors fetched from ALL countries.
+# 7Y is excluded: not available consistently across all four sources.
+# 15Y is excluded: FRED (US) has no DGS15 series, so we cannot get it
+#   natively for US without interpolation. To keep all country data clean
+#   and consistent we drop it from all countries.
+# This gives us a balanced 7-tenor panel: 1Y, 2Y, 3Y, 5Y, 10Y, 20Y, 30Y.
 COMMON_TENORS = ["1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y"]
 TENORS = COMMON_TENORS   # backwards-compat alias
 
@@ -97,6 +104,9 @@ def _fetch_ecb_tenor(args):
 
 def fetch_de_yields(start=DEFAULT_START, end=DEFAULT_END):
     if end is None: end = DEFAULT_END
+    # ECB requires one HTTP request per tenor (8 requests total).
+    # Running them sequentially takes ~30–60s due to API latency.
+    # ThreadPoolExecutor fires all 8 in parallel → completes in ~5–10s.
     from concurrent.futures import ThreadPoolExecutor, as_completed
     print("  [DE] Fetching from ECB SDMX-REST (parallel) ...")
     frames = {}

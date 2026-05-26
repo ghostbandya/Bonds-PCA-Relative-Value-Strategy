@@ -228,8 +228,24 @@ def get_cross_market_changes(
     Build a cross-market panel for multi-country PCA.
     Columns are named  '<country>_<tenor>'  (e.g. 'US_10Y', 'DE_10Y').
 
+    WHY A CROSS-MARKET PANEL?
+    ──────────────────────────
+    Running PCA on all countries jointly (rather than separately per country)
+    extracts GLOBAL factors that drive yields across US, DE, UK, JP together.
+    This is more powerful than per-country PCA because:
+      - PC1 becomes a global rates level factor (driven by G4 central bank policy)
+      - PC2 captures global curve slope (risk-on/off across all markets)
+      - The residuals isolate country-specific AND tenor-specific anomalies
+
+    Japan (JP) is included in the PCA for better factor estimation but is
+    EXCLUDED from trading (see main.py) because BoJ YCC 2012–2024 prevented
+    JGB yields from freely mean-reverting — the signal would be spurious.
+
+    Rows are restricted to dates where ALL included series are non-NaN.
+    This means the panel starts from the latest data source start date
+    (ECB data begins ~2004, so the cross-market panel starts ~2004).
+
     If tenors is specified, only those tenors are included for each country.
-    Rows are restricted to dates where ALL included series are available.
     """
     if tenors is None:
         tenors = ["1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y"]

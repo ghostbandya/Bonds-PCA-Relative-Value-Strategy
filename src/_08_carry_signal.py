@@ -3,24 +3,65 @@
 ==================
 Carry + Roll-Down strategy for sovereign bonds.
 
-Theory
-------
-For a bond with tenor T:
-  Carry     = yield_T  -  short_rate
-  Roll-Down = yield_T  -  yield_{T - horizon}    (where horizon = 1 year)
+═══════════════════════════════════════════════════════════════
+STRATEGY THEORY
+═══════════════════════════════════════════════════════════════
+This strategy harvests TWO structural bond return premia:
 
-  carry_roll_i = (carry_i + roll_down_i) / DV01_i
+1. CARRY — the excess yield over the short rate
+   ───────────────────────────────────────────
+   Carry_i = yield_T  −  short_rate
+   (short_rate = 2Y yield as proxy for financing cost)
 
-This is duration-normalised to make signals comparable across tenors.
+   A bond with positive carry earns more than its financing cost
+   if yields don't change.  Carry is the "income" component of
+   a funded bond position.  On average, the yield curve slopes
+   upward (long rates > short rates) so most bonds carry positively.
 
-Signal rules
-------------
-  Long  when  carry_roll_score  >  +entry_thr
-  Short when  carry_roll_score  <  -entry_thr
-  Close long  when  score  <  +exit_thr
-  Close short when  score  >  -exit_thr
+2. ROLL-DOWN — the yield pickup from curve roll
+   ─────────────────────────────────────────────
+   As time passes, a bond's remaining maturity shrinks.
+   A 10Y bond held for 1 year becomes a 9Y bond.
+   If the yield curve is upward-sloping, 9Y yields < 10Y yields,
+   so the bond's yield *falls* → its price *rises*.
+   This capital gain from "rolling down the curve" is roll-down.
 
-Regime filter: GOOD -> full size | NEUTRAL -> 50% | BAD -> flat
+   Roll-Down_i = yield_T  −  yield_{T − 1Y}
+   (= the yield drop expected over the next year from rolling)
+
+   We interpolate yield_{T-1Y} from the available curve data.
+
+3. COMBINED SCORE (duration-normalised)
+   ──────────────────────────────────────
+   score_i = (Carry_i + Roll_Down_i) / DV01_i
+
+   Dividing by DV01 normalises for duration so a 1Y bond and a 10Y
+   bond with the same raw carry+rolldown get the same signal magnitude.
+   Without this, long-duration bonds would always dominate the signal
+   simply because their carry is measured in more "price-sensitive" units.
+
+4. WHY RAW YIELD CHANGES FOR P&L (not factor-neutral residuals)?
+   ──────────────────────────────────────────────────────────────
+   The PCA strategy uses factor-neutral residual changes as its P&L
+   driver to isolate idiosyncratic spread reversion.  Carry is different:
+   carry IS the systematic level signal.  If we subtracted out the PC1
+   (level) move, we would remove exactly the yield move that carry is
+   trying to capture.  Carry P&L must be computed on raw yield changes.
+
+═══════════════════════════════════════════════════════════════
+SIGNAL RULES
+═══════════════════════════════════════════════════════════════
+  Long  when score >  +entry_thr  (default 0.10)
+  Short when score <  −entry_thr
+  Close long  when score <  +exit_thr   (default 0.02)
+  Close short when score >  −exit_thr
+
+  The thresholds are in carry+roll units (% per year per DV01 unit).
+  entry_thr = 0.10 means: only go long if the expected annual return
+  from carry+roll exceeds 0.10% per unit of DV01 — a modest filter
+  to avoid trading noise.
+
+REGIME FILTER: GOOD → full size | NEUTRAL → 50% | BAD → flat
 """
 
 import os
@@ -115,17 +156,26 @@ def compute_carry_roll(
             t_years = _tenor_years(t_label)
             dv01    = _get_dv01(t_label)
 
-            # Carry = instrument yield - short rate
+            # ── Carry = instrument yield − short rate ────────────────────
+            # Short rate proxy: the 2Y yield for each country.
+            # This approximates the cost of funding a bond position
+            # via repo for 1 year.  In practice repo ≈ OIS ≈ 2Y yield.
             carry = flat[col] - short_rate
 
-            # Roll-down (vectorised over dates)
-            rolled_t = t_years - roll_horizon_years
+            # ── Roll-down: yield drop from aging by 1 year ───────────────
+            # A T-year bond held for 1 year becomes a (T-1)-year bond.
+            # If the yield curve slopes up, its yield falls → price rises.
+            # roll_down = yield(T) − yield(T − 1Y)
+            # We linearly interpolate yield(T−1Y) from the available tenors.
+            rolled_t = t_years - roll_horizon_years     # target maturity after 1Y roll
             if rolled_t <= 0:
+                # Short-end bonds (1Y) roll off entirely → no roll benefit
                 roll_down = pd.Series(0.0, index=dates)
             else:
-                # Interpolate along tenor axis for each date row
-                y_now = flat[col].values          # (T,)
-                # For each date, interpolate ym[date, :] at rolled_t
+                # For each date, interpolate the country yield curve at rolled_t.
+                # ym[i] is the vector of all country yields on date i.
+                # tenor_yrs is the sorted array of available maturities.
+                y_now = flat[col].values
                 roll_vals = np.empty(len(dates))
                 roll_vals[:] = np.nan
                 for i in range(len(dates)):
@@ -137,8 +187,12 @@ def compute_carry_roll(
                         except Exception:
                             pass
                 y_rolled  = pd.Series(roll_vals, index=dates)
-                roll_down = flat[col] - y_rolled
+                roll_down = flat[col] - y_rolled     # positive when curve is upward-sloping
 
+            # ── Combined score, duration-normalised ───────────────────────
+            # Dividing by DV01 converts from "yield units" to "return units":
+            # a 0.10% carry on a 10Y bond (DV01=8.60) scores 0.012,
+            # same as a 0.012% carry on a 1Y bond (DV01=0.98) scores 0.012.
             raw = (carry + roll_down) / dv01
             result[col] = raw
 

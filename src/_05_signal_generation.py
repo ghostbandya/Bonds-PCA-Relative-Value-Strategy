@@ -3,33 +3,87 @@
 =======================
 Ornstein-Uhlenbeck fitting and S-score signal generation.
 
-For each instrument i and each date t:
-  1. Take the cumulated residual series X_i over the inner window (60 days)
-  2. Fit OU parameters by OLS on AR(1):
-       ΔX_i(t) = a + b · X_i(t-1) + noise
-       → κ = -log(1+b)/Δt    (mean-reversion speed)
-       → m = -a/b             (long-run mean; ≈ 0 by construction)
-       → σ_eq = std(noise) / sqrt(2κ)   (equilibrium std dev)
-  3. Compute S-score:
-       s_i(t) = X_i(t) / σ_eq,i(t)
-  4. Apply trading rules gated by regime:
-       GOOD    → trade at full size
-       NEUTRAL → trade at 50% size
-       BAD     → no new positions; close existing ones
+═══════════════════════════════════════════════════════════════
+THE ORNSTEIN-UHLENBECK (OU) PROCESS
+═══════════════════════════════════════════════════════════════
+The cumulated PCA residual X_i(t) is modelled as an OU process:
 
-Signal rules — YIELD-BASED convention
---------------------------------------
-  NOTE: PCA is on yield CHANGES, so the residual X_i has the same sign as yield.
-  High X_i → yield above model → bond price below model → bond is CHEAP → go LONG.
-  Low  X_i → yield below model → bond price above model → bond is EXPENSIVE → go SHORT.
-  This is the OPPOSITE of the Avellaneda & Lee equity convention
-  (where high residual = stock above model = expensive = short).
+    dX = κ(μ - X) dt + σ dW
 
-  Open long    s >  s_bo    (default 1.25)   bond cheap relative to factor model
-  Close long   s <  s_bc    (default 0.75)   mean reversion largely complete
-  Open short   s < −s_so    (default 1.25)   bond expensive relative to factor model
-  Close short  s > −s_sc    (default 0.50)   mean reversion largely complete
-  Filter       κ  >  κ_min  (default 8.4 = half-life < 30 days)
+where:
+  κ  = mean-reversion speed  (how fast X snaps back to μ)
+  μ  = long-run mean          (≈ 0 by PCA construction)
+  σ  = diffusion coefficient  (daily innovation std dev)
+
+The OU process is the continuous-time limit of an AR(1) model.
+We fit it via OLS on the discrete AR(1):
+
+    ΔX(t) = a + b · X(t-1) + ε
+
+Then map AR(1) coefficients to OU parameters:
+  κ = -log(1+b) / Δt        [mean-reversion speed, annualised]
+  μ = -a / b                 [long-run mean]
+  σ_OU = std(ε)              [daily residual std dev]
+
+Half-life = log(2) / κ      [time for X to decay halfway to μ]
+
+═══════════════════════════════════════════════════════════════
+S-SCORE NORMALISATION
+═══════════════════════════════════════════════════════════════
+The S-score is X_i normalised by the OU equilibrium std dev:
+
+    σ_eq = σ_OU / √(2κ)
+
+σ_eq is the std dev that X_i would have if it were in steady state.
+It tells us how far X_i "normally" wanders from zero.  An S-score
+of ±2 means X_i is at ±2 equilibrium standard deviations — a
+meaningful deviation that should revert.
+
+WHY FLOOR σ_eq AT 60% OF EMPIRICAL STD(X)?
+When κ is very large (fast mean reversion), σ_eq → 0, making S-scores
+blow up to ±100.  This is a calibration artefact, not genuine signal.
+We floor σ_eq at 0.60 × std(X), which caps |S| at ~3.3σ for a 2-sigma
+deviation and puts the ±5 hard cap at a genuine 3.3+ sigma event.
+
+═══════════════════════════════════════════════════════════════
+YIELD CONVENTION — OPPOSITE TO EQUITY STAT-ARB
+═══════════════════════════════════════════════════════════════
+PCA residuals are in yield-change space, so X_i has the same sign
+as the yield deviation from model:
+
+  X_i > 0  →  yield ABOVE model  →  bond PRICE below model
+             →  bond is CHEAP    →  go LONG   (buy the bond)
+
+  X_i < 0  →  yield BELOW model  →  bond PRICE above model
+             →  bond is EXPENSIVE →  go SHORT  (sell the bond)
+
+This is the OPPOSITE of Avellaneda & Lee (2010) for equities,
+where a high residual means the stock is overpriced → short.
+The sign flip is because yields and prices move inversely.
+
+═══════════════════════════════════════════════════════════════
+SIGNAL THRESHOLDS (default values)
+═══════════════════════════════════════════════════════════════
+  s_bo = 1.25  open long   (bond cheap by 1.25 σ_eq)
+  s_bc = 0.75  close long  (reversion mostly complete)
+  s_so = 1.25  open short  (bond rich by 1.25 σ_eq)
+  s_sc = 0.50  close short (reversion mostly complete)
+
+  Asymmetric exit thresholds (0.75 / 0.50 vs. entry 1.25):
+  We close positions before full reversion to capture most of the
+  move while avoiding reversal risk if the spread re-widens.
+
+  κ_min = 8.4  corresponds to half-life < 30 days.
+  We only trade instruments where the OU model predicts reversion
+  within ~1 month.  Slower mean reversion is too slow to monetise
+  before positions get hit by factor moves.
+
+═══════════════════════════════════════════════════════════════
+REGIME FILTER
+═══════════════════════════════════════════════════════════════
+  GOOD    → full position size (±1.0)
+  NEUTRAL → half size (±0.5) — PCA structure shifting, less confidence
+  BAD     → flat — PCA broken, residuals no longer mean-revert reliably
 """
 
 import os
@@ -81,20 +135,28 @@ def fit_ou_params(x: np.ndarray, dt: float = 1/252) -> dict:
     sigma   = resid.std(ddof=2)
 
     # OU parameters
+    # ── Map AR(1) → OU parameters ────────────────────────────────────────
+    # AR(1):  X_t = (1+b)X_{t-1} + a + ε
+    # OU discrete:  X_t = e^{-κΔt} X_{t-1} + μ(1-e^{-κΔt}) + noise
+    # Matching coefficients: e^{-κΔt} = (1+b)  →  κ = -log(1+b)/Δt
+    # Require (1+b) > 0 i.e. b > -1, otherwise the AR(1) is explosive.
     kappa   = -np.log(1 + b) / dt if (1 + b) > 0 else np.nan
     mu      = -a / b if abs(b) > 1e-10 else 0.0
     half_life = np.log(2) / kappa if (kappa is not np.nan and kappa > 0) else np.nan
 
-    # σ_eq = σ_OU / √(2κ)  — the OU equilibrium std dev.
-    # For low-volatility instruments (e.g. JGB) the OU innovations σ can be
-    # tiny, making σ_eq → 0 and S-scores blow up to ±100+.  We floor σ_eq at
-    # 30% of the window's empirical std of X, which bounds |S| to ~10×
-    # (3 empirical stds / 0.30 = 10) — well within a ±5 cap applied below.
+    # ── σ_eq: equilibrium standard deviation of the OU process ───────────
+    # σ_eq = σ_OU / √(2κ)
+    # In steady state, Var(X) = σ²/(2κ), so σ_eq is the "natural" spread.
+    # An S-score of ±1 means X is at ±1 σ_eq from its long-run mean.
+    #
+    # FLOOR RATIONALE:
+    # When κ is very large (very fast mean reversion), σ_eq → 0, which would
+    # make S-scores blow up to ±100+ for even tiny movements.  This is a
+    # calibration artefact, not real signal.  We floor at 60% of the window's
+    # empirical std(X), so the largest |S| from a 2-sigma event is:
+    #   |S| = 2·std(X) / (0.60·std(X)) = 3.33 — safely within the ±5 cap.
     if kappa is not np.nan and kappa > 0:
         sigma_eq_theory = sigma / np.sqrt(2 * kappa)
-        # Floor at 60% of window empirical std of X.
-        # With floor = 0.60 * std(X), a 2-sigma deviation gives |S| ≈ 3.3,
-        # so the ±5 cap is hit only in genuine tail events (~1-2% of obs).
         sigma_eq_floor  = np.std(x) * 0.60
         sigma_eq        = max(sigma_eq_theory, sigma_eq_floor)
     else:
@@ -236,7 +298,10 @@ def generate_signals(
         for i in range(n):
             r = reg.iloc[i]
 
-            if r == 2:   # BAD — force flat
+            # BAD regime: force all positions to zero.
+            # The PCA factor structure has broken down → residuals no longer
+            # mean-revert predictably → any open trade is noise-driven.
+            if r == 2:
                 pos = 0.0
                 sig_matrix[i, j] = 0
                 pos_matrix[i, j] = 0
@@ -244,14 +309,21 @@ def generate_signals(
 
             si = s[i]
             if np.isnan(si):
+                # No valid S-score this date — hold current position, no new signal
                 sig_matrix[i, j] = np.nan
                 pos_matrix[i, j] = pos
                 continue
 
-            size = 1.0 if r == 0 else size_neutral  # scale down in NEUTRAL
+            # NEUTRAL: same signal logic but half position size.
+            # Factor structure is shifting — we still trade but reduce risk.
+            size = 1.0 if r == 0 else size_neutral
 
-            # Exit existing position first
-            # YIELD convention: long when S > s_bo, exit when S falls below s_bc
+            # ── EXIT logic (check before entry to avoid flip in one step) ──
+            # Close long when S has fallen back toward zero (reversion done).
+            # Close short when S has risen back toward zero.
+            # Asymmetric thresholds: we close at 0.75/0.50, not 1.25.
+            # This locks in most of the mean-reversion move without waiting
+            # for full convergence (which may never arrive perfectly).
             if pos > 0 and si < s_bc:
                 pos = 0.0
                 sig_matrix[i, j] = 0
@@ -259,9 +331,10 @@ def generate_signals(
                 pos = 0.0
                 sig_matrix[i, j] = 0
 
-            # Open new position (only if currently flat)
-            # YIELD convention: go LONG when yield is above model (S > +s_bo = cheap bond)
-            #                   go SHORT when yield is below model (S < -s_so = expensive bond)
+            # ── ENTRY logic (only when flat) ───────────────────────────────
+            # YIELD convention (opposite of equity stat-arb):
+            #   S > +s_bo → yield above model → bond cheap → BUY (long)
+            #   S < -s_so → yield below model → bond rich  → SELL (short)
             if pos == 0:
                 if si > s_so:
                     pos = size

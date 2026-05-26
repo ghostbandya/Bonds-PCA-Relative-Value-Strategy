@@ -1,40 +1,80 @@
 """
 03_rolling_pca.py
 =================
-Rolling PCA engine — the analytical core of the project.
+Rolling PCA engine — the analytical core of the strategy.
 
-What this module does
----------------------
-For each date t in the dataset:
-  1. Takes a lookback window of `corr_window` days of yield changes
-  2. Standardises the changes (zero-mean, unit-variance)
-  3. Computes the empirical correlation matrix
-  4. Eigen-decomposes it, keeping top-k eigenvectors
-  5. Records:
-       - eigenvalues (λ₁, λ₂, λ₃) and cumulative variance explained
-       - eigenvector stability: cosine similarity to previous window
-       - factor scores (PC₁, PC₂, PC₃) for each day in the window
-       - residuals for each maturity after projecting out factors
+═══════════════════════════════════════════════════════════════
+WHY PCA ON YIELD CURVES?
+═══════════════════════════════════════════════════════════════
+With 28 yield series (7 tenors × 4 countries) we would normally
+need to track a 28×28 covariance matrix.  PCA collapses this to
+3 uncorrelated "meta-drivers" that explain ~75% of total variance
+in a cross-country panel (and ~99% within a single country).
 
-Key design choices
-------------------
-- PCA is run on *changes* (stationary), not levels
-- We use the *correlation* matrix (not covariance) so high-vol tenors
-  don't dominate; this is the standard approach in PCA Unleashed
-- Rolling window of 252 business days (≈ 1 year)
-- We record eigenvector angles between consecutive windows:
-    cos θ = v_t · v_{t-1}  (should be close to 1 when stable)
+The 3 factors have well-known interpretations:
+  PC1 — Level    : parallel shift, all yields move together
+                   (~90% of variance in single-country PCA)
+  PC2 — Slope    : curve steepens / flattens (2s10s spread)
+  PC3 — Curvature: belly bows up or down relative to wings
+                   (5Y moves opposite to 2Y+30Y)
 
-Outputs
--------
-  results dict:
-    'loadings'         : dict {date → np.array (n_tenors × k)}
-    'eigenvalues'      : DataFrame (date × k)
-    'var_explained'    : DataFrame (date × ['PC1','PC2','PC3','cumulative'])
-    'ev_stability'     : DataFrame (date × ['PC1_cos','PC2_cos','PC3_cos'])
-    'factor_scores'    : DataFrame (date × ['PC1','PC2','PC3'])
-    'residuals'        : DataFrame (date × n_instruments) — cumulated residuals
-    'r_squared'        : Series (date) — R² of factor model each day
+═══════════════════════════════════════════════════════════════
+WHAT THIS MODULE DOES — STEP BY STEP
+═══════════════════════════════════════════════════════════════
+For each date t (once we have at least corr_window days of history):
+
+  1. CORRELATION WINDOW  [t - 252 : t]
+     Build the standardised yield-change matrix Z ∈ ℝ^{252 × N}.
+     Compute the empirical correlation matrix C = Z'Z / 251.
+     Eigen-decompose: C = V Λ V',  keep top k=3 columns of V.
+
+  2. STABILITY CHECK
+     Measure how much the eigenvectors rotated vs. yesterday via
+     cosine similarity  cos θ = |v_t · v_{t-1}|.
+     Values near 1.0 = stable factor structure.
+     Sudden drop → regime feature used downstream.
+
+  3. RESIDUAL WINDOW  [t - 60 : t]
+     Using the loadings from step 1, project the inner 60-day
+     window of yield changes onto the 3 PCs:
+       F = Z · V_k          (factor scores, T×k)
+     OLS-regress each instrument on F to get betas β_i:
+       Δy_i = β_i1 F1 + β_i2 F2 + β_i3 F3 + ε_i
+     Cumulate the residuals: X_i(t) = Σ ε_i
+     This running integral of the idiosyncratic component is
+     what the OU / S-score model then fits.
+
+     Why 60 days for residuals but 252 for correlation?
+       - 252 days gives a stable covariance estimate (more data = better)
+       - 60 days keeps the OU calibration window short so κ reflects
+         current mean-reversion speed, not stale dynamics from a year ago
+
+  4. R² diagnostic
+     R²_i = 1 - SS_res_i / SS_tot_i across the residual window.
+     High R² (>0.80) means the 3 PCs explain the instrument well —
+     a good condition for the residual to mean-revert predictably.
+
+═══════════════════════════════════════════════════════════════
+KEY DESIGN CHOICE — CORRELATION vs COVARIANCE MATRIX
+═══════════════════════════════════════════════════════════════
+We standardise (divide by vol) before PCA, i.e. use the correlation
+matrix.  Alternative: covariance matrix (no standardisation).
+
+Covariance PCA would let high-volatility instruments (e.g. 30Y in
+a sell-off) dominate the first eigenvector simply because they move
+more in absolute bps terms.  We want PC1 to represent a *structural*
+parallel shift, not just "whichever tenor is most volatile today."
+Correlation PCA is the practitioner standard (CS PCA Unleashed, 2012).
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FILES  (outputs/pca/)
+═══════════════════════════════════════════════════════════════
+  residuals.csv       — cumulated OU residuals X_i(t), one column per instrument
+  factor_scores.csv   — daily PC1/PC2/PC3 time series
+  var_explained.csv   — fraction of variance each PC explains, plus cumulative
+  eigenvalues.csv     — raw eigenvalues λ1, λ2, λ3 per date
+  ev_stability.csv    — cosine similarity of each PC to previous day's eigenvector
+  r_squared.csv       — mean R² of factor model across instruments
 """
 
 import os
@@ -77,28 +117,38 @@ def run_pca_on_window(
       'cum_var'       : float           — cumulative variance of top-k PCs
       'factor_scores' : DataFrame (T × k) — PC time series over the window
     """
-    # Standardise within window
+    # ── Step 1: Standardise ──────────────────────────────────────────────────
+    # Each column is zero-meaned and divided by its std dev.
+    # This turns the covariance matrix into a correlation matrix, preventing
+    # high-vol tenors (e.g. 30Y in a sell-off) from dominating PC1.
     scaler    = StandardScaler()
     Z         = scaler.fit_transform(window.values)  # shape (T, N)
     T, N      = Z.shape
 
-    # Correlation matrix  C = Z'Z / (T-1)
+    # ── Step 2: Correlation matrix  C = Z'Z / (T-1) ──────────────────────
+    # Equivalent to np.corrcoef(window.T) but faster when called thousands of times.
     C         = (Z.T @ Z) / (T - 1)
 
-    # Eigen-decomposition — numpy returns in ascending order, so reverse
+    # ── Step 3: Eigendecomposition ────────────────────────────────────────
+    # np.linalg.eigh is for symmetric matrices (faster + numerically stable
+    # vs. np.linalg.eig). Returns eigenvalues in *ascending* order → reverse.
     eigenvalues, eigenvectors = np.linalg.eigh(C)
-    idx          = np.argsort(eigenvalues)[::-1]
+    idx          = np.argsort(eigenvalues)[::-1]   # descending order
     eigenvalues  = eigenvalues[idx]
     eigenvectors = eigenvectors[:, idx]   # (N × N), columns = eigenvectors
 
-    # Retain top k
+    # ── Step 4: Retain top k ──────────────────────────────────────────────
+    # We keep k=3 by default (level, slope, curvature).
+    # The fraction of total variance explained by PC_j = λ_j / Σλ_i.
     top_eigenvalues  = eigenvalues[:k]
     top_eigenvectors = eigenvectors[:, :k]   # (N × k)
 
     var_explained = top_eigenvalues / eigenvalues.sum()
     cum_var       = var_explained.sum()
 
-    # Factor scores  F = Z · V_k   shape (T × k)
+    # ── Step 5: Factor scores  F = Z · V_k   shape (T × k) ───────────────
+    # Each row of F is the projection of that day's yield-change vector
+    # onto the k principal directions. These are the "factor realisations."
     factor_scores = pd.DataFrame(
         Z @ top_eigenvectors,
         index   = window.index,
@@ -147,10 +197,13 @@ def extract_residuals(
     dy         = changes_window.loc[common].values    # (T × N)
     F          = factor_scores.loc[common].values     # (T × k)
 
-    # OLS:  β = (F'F)^{-1} F' dy
+    # ── OLS:  β = (F'F)^{-1} F' dy ──────────────────────────────────────
+    # For each instrument i, solve:  Δy_i = β_{i1}F_1 + β_{i2}F_2 + β_{i3}F_3
+    # No intercept because the PCA factors are zero-mean by construction.
+    # lstsq handles the matrix case (all N instruments simultaneously).
     betas      = np.linalg.lstsq(F, dy, rcond=None)[0]   # (k × N)
-    fitted     = F @ betas                                 # (T × N)
-    residuals  = dy - fitted                               # (T × N)
+    fitted     = F @ betas                                 # (T × N) — PCA-implied moves
+    residuals  = dy - fitted                               # (T × N) — idiosyncratic moves
 
     # R² per instrument
     ss_res = (residuals ** 2).sum(axis=0)
@@ -159,6 +212,10 @@ def extract_residuals(
 
     col_names  = changes_window.columns.tolist()
     resid_df   = pd.DataFrame(residuals,   index=common, columns=col_names)
+    # Cumulate: X_i(t) = Σ_{s≤t} ε_i(s)
+    # This integral of the daily idiosyncratic residuals is the "spread" of
+    # the instrument's yield from its PCA-implied fair value.
+    # It is stationary (mean-reverting) and is the input to the OU model.
     cumresid   = resid_df.cumsum()
     betas_df   = pd.DataFrame(betas.T, index=col_names,
                               columns=[f"PC{i+1}" for i in range(betas.shape[0])])
@@ -231,6 +288,12 @@ def rolling_pca(
         pca_res = run_pca_on_window(win_corr_clean, k=k)
 
         # ── Eigenvector stability (cosine similarity to previous window) ──────
+        # cos θ_j = |v_t,j · v_{t-1,j}| ∈ [0, 1].
+        # A value of 1.0 means the j-th eigenvector didn't rotate at all.
+        # A value near 0 means PC_j has flipped direction — the factor
+        # structure has changed.  We use absolute value because eigenvectors
+        # are defined only up to a sign flip (V and -V span the same subspace).
+        # Low cos_sim → regime feature → regime detector flags as BAD.
         vecs = pca_res["eigenvectors"]   # (N × k) — may be subset if columns dropped
         cos_sims = [np.nan] * k
         if prev_vecs is not None and prev_vecs.shape == vecs.shape:

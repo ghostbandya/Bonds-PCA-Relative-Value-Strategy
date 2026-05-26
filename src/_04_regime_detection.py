@@ -197,11 +197,27 @@ def normalize_features_percentile(
     """
     Convert each feature column to its expanding-window percentile rank [0, 1].
 
-    Why: cross-market PCA features live in a narrow absolute range
-    (cum_var ≈ 0.69–0.84) so a Gaussian HMM struggles to separate states.
-    Mapping to percentile ranks preserves relative ordering and gives the HMM
-    a well-scaled [0,1] input regardless of the absolute level — the same
-    approach used in cross-sectional equity factor models.
+    WHY PERCENTILE RANKS INSTEAD OF RAW VALUES?
+    ─────────────────────────────────────────────
+    A Gaussian HMM assumes each feature is drawn from one of n_states Gaussian
+    distributions.  It finds states by separating the data into clusters of
+    similar feature values.
+
+    Cross-market PCA features live in a narrow absolute range:
+      cum_var    ≈ 0.69 – 0.84   (total range of only 0.15!)
+      mean_cos   ≈ 0.998 – 1.000 (range of 0.002!)
+
+    In absolute terms, the HMM cannot meaningfully separate regimes because
+    all 6,000 data points look nearly identical.  But in *relative* terms,
+    the top 30% of cum_var days are clearly different from the bottom 30%.
+
+    Expanding percentile rank maps each day to its position in the historical
+    distribution so far: 0 = lowest ever seen, 1 = highest ever seen.
+    This is look-ahead-bias-free (expanding, not full-sample) and gives the
+    HMM well-separated [0,1] inputs regardless of the absolute feature level.
+
+    The same approach is standard in cross-sectional equity factor models
+    (e.g. ranking stocks by P/E within a universe rather than using raw P/E).
     """
     return features.expanding(min_periods=min_periods).rank(pct=True)
 
@@ -284,8 +300,14 @@ def classify_hmm(
     )
 
     # ── Relabel states by cum_var rank ────────────────────────────────────────
-    # Always rank by raw (un-normalised) cum_var so the semantic labels are
-    # consistent: highest raw cum_var → GOOD, lowest → BAD.
+    # HMM states are arbitrary integers (0,1,2) with no inherent ordering.
+    # We assign semantic meaning by ranking the states by their average
+    # raw (un-normalised) cum_var:
+    #   highest mean cum_var → regime 0 = GOOD  (PCA structure intact)
+    #   middle               → regime 1 = NEUTRAL
+    #   lowest mean cum_var  → regime 2 = BAD   (PCA structure broken)
+    # Using raw (not normalised) cum_var ensures the label is stable across
+    # different datasets and time periods.
     raw_cum_var = features.loc[feat_input.index, "cum_var"]
     state_means = {}
     for s in range(n_states):

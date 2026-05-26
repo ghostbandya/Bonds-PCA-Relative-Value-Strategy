@@ -1,38 +1,53 @@
 """
 06_backtest.py
 ==============
-Strategy backtest engine.
+Strategy backtest engine — translates positions into P&L and performance metrics.
 
-The backtest translates target positions (from 05_signal_generation) into
-P&L using daily yield changes. Because we trade bond futures, P&L is
-computed via price returns, not yield returns.
+═══════════════════════════════════════════════════════════════
+P&L CALCULATION — TWO MODES
+═══════════════════════════════════════════════════════════════
+Mode A — Futures price returns  (preferred if futures data available)
+  pnl_i(t) = position_i(t-1) × [px_i(t) - px_i(t-1)] / px_i(t-1)
+  This is a mark-to-market return on the notional invested.
 
-P&L logic
----------
-  For each instrument i on date t:
-    raw_pnl_i(t) = position_i(t-1) × price_return_i(t)
+Mode B — Yield-change P&L  (used in this project — no futures prices)
+  Bond price ≈ -DV01 × Δyield  (first-order duration approximation)
+  pnl_i(t) = -DV01_base × position_i(t-1) × Δresidual_i(t) / 100
 
-  Where price_return can be:
-    - futures_price_return : (px_t - px_{t-1}) / px_{t-1}   [preferred]
-    - yield_change_pnl     : -DV01 × position × Δy_i(t)     [fallback]
+  CRITICAL DESIGN CHOICE — CONSTANT DV01_BASE:
+  Instead of each instrument's own DV01 (which varies from ~1 for 1Y
+  to ~19 for 30Y), we use a single constant DV01_BASE = 8.60 (the 10Y
+  reference).  This is DURATION-NEUTRAL sizing:
 
-  Since we normalise positions to ±1 (or ±0.5 in NEUTRAL), P&L is in
-  return units per unit notional.
+    Effective weight = position × DV01_base / DV01_instrument
 
-Portfolio P&L
--------------
-  Total daily return = mean of individual instrument returns (equal-weight)
-  Sharpe = annualised mean / annualised std of daily returns
-  Max drawdown from cumulative return series
+  A long in US_30Y and a long in US_1Y both have the same price
+  sensitivity to a 1 bps yield move.  Without this, 30Y positions
+  would dominate P&L even if position sizes were equal.
 
-Regime-conditioned stats are also computed separately for GOOD/NEUTRAL/BAD.
+  Note: we apply DV01 to RESIDUAL changes (not raw yield changes).
+  This removes systematic factor P&L (PC1/PC2/PC3 moves) and isolates
+  the idiosyncratic spread reversion — the actual source of alpha.
 
-Outputs
--------
-  outputs/backtest/
-    pnl_daily.csv      — daily P&L per instrument
-    pnl_total.csv      — portfolio-level daily & cumulative P&L
-    metrics.csv        — summary statistics
+═══════════════════════════════════════════════════════════════
+TRANSACTION COSTS
+═══════════════════════════════════════════════════════════════
+2 bps (0.0002) charged on every position change (one-way).
+This is conservative for IG govt bonds / futures (typical bid-ask
+for on-the-run Treasuries ≈ 0.25–0.5 bps; futures ≈ 0.1 bps).
+The conservative estimate accounts for market impact and slippage
+in a live implementation.
+
+═══════════════════════════════════════════════════════════════
+PORTFOLIO AGGREGATION
+═══════════════════════════════════════════════════════════════
+Daily portfolio return = sum of instrument P&Ls / number of active positions
+(equal-weight, not equal-notional, since all positions are already DV01-normalised)
+
+Regime-conditioned stats are computed separately by slicing the daily
+returns into GOOD / NEUTRAL / BAD subsets.  The GOOD Sharpe is the most
+meaningful metric — it measures alpha in the environment where the strategy
+is designed to work.
 """
 
 import os
@@ -137,25 +152,31 @@ def compute_pnl(
             return pd.DataFrame(), pd.DataFrame()
         pos = positions.loc[common_dates, common_cols]
         dy  = yield_changes.loc[common_dates, common_cols]
-        # Duration-neutral P&L (equal dollar-duration per instrument):
+        # ── Duration-neutral P&L ─────────────────────────────────────────
+        # pnl_i(t) = -DV01_base × pos_i(t-1) × Δresidual_i(t) / 100
         #
-        #   pnl_i = -DV01_base × position_i(t-1) × Δresidual_i(t) / 100
+        # The /100 converts yield changes from percent to decimal
+        # (e.g. 0.05 % move → 0.0005 decimal → ~4.3 bps × 8.60 ≈ 0.037%).
         #
-        # Instead of weighting by instrument-specific DV01 (which makes 30Y
-        # positions 10× more impactful than 2Y), we apply a CONSTANT DV01 equal
-        # to the 10Y reference (8.60).  This is equivalent to first scaling each
-        # position inversely by its DV01:
-        #   pos_adj_i = pos_i × (DV01_base / DV01_i)
-        # and then multiplying by DV01_i → the DV01s cancel, leaving DV01_base.
-        #
-        # Result: all instruments contribute equal price-sensitivity per
-        # unit of residual yield move — a truly duration-neutral portfolio.
+        # Why a CONSTANT DV01_BASE = 8.60 (10Y reference)?
+        # If we used each instrument's own DV01, a 1 bps residual move on
+        # US_30Y (DV01 ≈ 19.5) would generate 2.3× the P&L of the same
+        # move on US_5Y (DV01 ≈ 4.55), even with identical position sizes.
+        # The 30Y would dominate even if we had equal confidence in both signals.
+        # Using DV01_BASE equalises price-sensitivity across all instruments
+        # so every signal contributes proportionally to the portfolio.
         DV01_BASE  = 8.60          # 10Y modified duration (reference)
         pnl_instr  = -(pos.shift(1) * dy) * (DV01_BASE / 100.0)
     else:
         raise ValueError("Provide either price_returns or yield_changes.")
 
-    # Transaction costs — charged on position changes (trades)
+    # ── Transaction costs ────────────────────────────────────────────────
+    # pos.diff().abs() captures the size of every position change:
+    #   0 → no trade (hold), no cost
+    #   1 → new trade opened (from 0 to ±1), or full flip (from -1 to +1)
+    #   2 → rare; in practice positions go 0→±1 or ±1→0
+    # Default 2 bps (0.0002) is conservative relative to actual govt bond
+    # bid-ask spreads but captures realistic execution friction.
     trades     = pos.diff().abs()
     tc_instr   = trades * transaction_cost
     pnl_instr -= tc_instr
