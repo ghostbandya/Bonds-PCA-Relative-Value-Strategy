@@ -165,9 +165,6 @@ parallel (8 simultaneous) to avoid serial latency. The BoE fetcher downloads a
 single ZIP containing multiple Excel files spanning different year ranges.
 
 **Common tenor set**: `1Y, 2Y, 3Y, 5Y, 10Y, 20Y, 30Y`
-- 7Y excluded: inconsistent availability across all sources
-- 15Y excluded: FRED has no DGS15 series; to keep country data symmetric it is
-  dropped from all countries rather than interpolated for US
 
 ---
 
