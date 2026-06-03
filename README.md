@@ -1,4 +1,3 @@
-# Applied Quantitative Macro Strategies
 ## PCA-Based Sovereign Bond Mean-Reversion + Carry/Roll-Down
 
 

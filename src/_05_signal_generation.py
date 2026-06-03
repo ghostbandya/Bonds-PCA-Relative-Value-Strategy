@@ -405,3 +405,168 @@ def run_signals(
         "signals":   signals,
         "ou_params": ou_params,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Z-SCORE SIGNAL — Jay's approach (simpler and more robust than OU)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# COMPARISON: OU S-score vs Rolling Z-score
+# ─────────────────────────────────────────
+# OU S-score: fits an AR(1) model to estimate σ_eq from mean-reversion speed.
+#   + Theoretically grounded (OU process)
+#   - σ_eq can blow up when κ is large (needs floor)
+#   - OU fitting needs ~30+ obs to be stable
+#
+# Rolling Z-score: (z - trailing_mean) / trailing_std over a window.
+#   + Simpler: no model fitting required
+#   + No blow-up risk
+#   + Strictly causal (trailing window only)
+#   - No explicit link to mean-reversion speed
+#
+# In Jay's results, the z-score approach with Method 3 achieves IR 1.318
+# (gross) — significantly better than the OU S-score baseline.
+# Both are available; choose via signal_method parameter in run_signals().
+
+def compute_z_scores(
+    residuals: pd.DataFrame,
+    z_window: int = 63,
+    version: str = "A",
+    refit_dates: list = None,
+    K: int = None,
+) -> pd.DataFrame:
+    """
+    Compute rolling z-scores on cumulated PCA residuals.
+
+    Version A: cumulative sum resets to zero at each refit boundary.
+               Cleaner — doesn't mix residuals from different PCA vintages.
+    Version B: rolling sum over the last K residuals.
+
+    Parameters
+    ----------
+    residuals    : DataFrame (date x instruments) — daily PCA residuals
+    z_window     : trailing window for mean/std normalisation
+    version      : "A" (block-reset) | "B" (rolling-K sum)
+    refit_dates  : list of refit boundary dates (required for Version A)
+    K            : rolling window for Version B cumsum
+
+    Returns
+    -------
+    z_scores : DataFrame (date x instruments) — z-score per instrument
+               NaN where window is not yet warm.
+    """
+    if version == "A":
+        # Block-reset cumulative residual
+        # At each refit boundary, reset the cumsum to zero.
+        # This ensures residuals from different PCA models don't mix.
+        if refit_dates is None:
+            # Fall back to a single block (standard cumsum)
+            cum = residuals.cumsum()
+        else:
+            cum = pd.DataFrame(np.nan, index=residuals.index, columns=residuals.columns)
+            refit_pos = sorted(
+                {residuals.index.get_loc(d) for d in refit_dates
+                 if d in residuals.index}
+            )
+            bounds = refit_pos + [len(residuals)]
+            for k_idx in range(len(bounds) - 1):
+                s, e = bounds[k_idx], bounds[k_idx + 1]
+                if e <= s:
+                    continue
+                cum.iloc[s:e] = residuals.iloc[s:e].cumsum().values
+
+    elif version == "B":
+        if K is None:
+            raise ValueError("version='B' requires K to be specified")
+        cum = residuals.rolling(K, min_periods=K).sum()
+
+    else:
+        raise ValueError(f"version must be 'A' or 'B'; got '{version}'")
+
+    # Strictly-causal trailing z-score (no centering; ddof=1)
+    # min_periods=z_window ensures NaN until the window is warm.
+    mu = cum.rolling(z_window, min_periods=z_window).mean()
+    sd = cum.rolling(z_window, min_periods=z_window).std(ddof=1)
+    sd = sd.replace(0.0, np.nan)
+
+    z_scores = (cum - mu) / sd
+    return z_scores
+
+
+def run_signals(
+    pca_results:  dict,
+    regime_dict:  dict,
+    resid_window: int   = 60,
+    kappa_min:    float = 8.4,
+    s_bo: float = 1.25, s_bc: float = 0.75,
+    s_so: float = 1.25, s_sc: float = 0.50,
+    save: bool = True,
+    signal_method: str = "ou",       # "ou" (original) | "zscore" (Jay's approach)
+    z_window: int = 63,               # z-score window (used when signal_method="zscore")
+    version: str = "A",               # "A" | "B" (z-score cumulation style)
+    refit_dates: list = None,         # for Version A block-reset
+    K: int = None,                    # for Version B rolling sum
+) -> dict:
+    """
+    Full signal generation pipeline.
+
+    signal_method="ou"     : original OU S-score approach
+    signal_method="zscore" : Jay's rolling z-score approach (recommended)
+    """
+    print("=" * 50)
+    print("  Signal Generation Pipeline")
+    print(f"  Method: {signal_method.upper()}")
+    print("=" * 50)
+
+    if signal_method == "ou":
+        print("\n[1] Computing S-scores (OU method) …")
+        s_scores, ou_params = compute_s_scores(
+            pca_results["residuals"],
+            resid_window=resid_window,
+            kappa_min=kappa_min,
+        )
+        print(f"    S-scores shape: {s_scores.shape}")
+    else:
+        print(f"\n[1] Computing Z-scores (window={z_window}, version={version}) …")
+        s_scores = compute_z_scores(
+            pca_results["residuals"],
+            z_window=z_window,
+            version=version,
+            refit_dates=refit_dates,
+            K=K,
+        )
+        ou_params = pd.DataFrame()
+        print(f"    Z-scores shape: {s_scores.shape}")
+
+    # Cap z-scores at ±5 (same as OU S-score convention)
+    s_scores = s_scores.clip(-5.0, 5.0)
+
+    print("[2] Generating positions …")
+    positions, signals = generate_signals(
+        s_scores, regime_dict["regime"],
+        s_bo=s_bo, s_bc=s_bc, s_so=s_so, s_sc=s_sc,
+    )
+
+    active_pct = (positions != 0).mean().mean() * 100
+    long_pct   = (positions > 0).mean().mean() * 100
+    short_pct  = (positions < 0).mean().mean() * 100
+    print(f"    Active positions: {active_pct:.1f}% of (date, instrument) cells")
+    print(f"    Long / Short:     {long_pct:.1f}% / {short_pct:.1f}%")
+
+    if save:
+        out = os.path.join(OUTPUT_DIR, "signals")
+        os.makedirs(out, exist_ok=True)
+        s_scores.to_csv(os.path.join(out, "s_scores.csv"))
+        positions.to_csv(os.path.join(out, "positions.csv"))
+        signals.to_csv(os.path.join(out, "signals.csv"))
+        if not ou_params.empty:
+            ou_params.to_csv(os.path.join(out, "ou_params.csv"))
+        print(f"    Signals saved to {out}/")
+
+    return {
+        "s_scores":     s_scores,
+        "positions":    positions,
+        "signals":      signals,
+        "ou_params":    ou_params,
+        "signal_method": signal_method,
+    }

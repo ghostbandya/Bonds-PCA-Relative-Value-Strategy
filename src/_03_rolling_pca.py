@@ -229,12 +229,13 @@ def extract_residuals(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def rolling_pca(
-    changes: pd.DataFrame,
+    changes:       pd.DataFrame,
     k:             int   = 3,
     corr_window:   int   = 252,
     resid_window:  int   = 60,
     step:          int   = 1,
     verbose:       bool  = True,
+    train_end:     "pd.Timestamp | None" = None,
 ) -> dict:
     """
     Run rolling PCA across the full history of yield changes.
@@ -243,14 +244,27 @@ def rolling_pca(
       - Fit PCA on changes[t - corr_window : t]
       - Extract factor scores and residuals on changes[t - resid_window : t]
 
+    train_end — prevents test-set leakage into PCA fitting
+    ─────────────────────────────────────────────────────
+    When train_end is set:
+      - Dates ≤ train_end: PCA loadings are fitted normally (rolling window)
+      - Dates > train_end: the last training-period PCA (fitted at train_end)
+        is FROZEN and applied forward to generate test-period residuals.
+
+    This means the PCA model never refits using test-period yield data.
+    The test-period residuals are therefore genuinely out-of-sample — they
+    measure how each bond deviates from a model estimated only on past data.
+
     Parameters
     ----------
     changes       : DataFrame (T × N) — daily yield changes, all instruments
     k             : number of PCs to retain
     corr_window   : lookback window for correlation matrix (default 252 = 1 year)
-    resid_window  : inner window for OU residual estimation (default 60 days)
+    resid_window  : inner window for residual estimation (default 60 days)
     step          : roll every `step` days (1 = daily, 5 = weekly)
     verbose       : print progress
+    train_end     : last date of training split; PCA freezes after this date.
+                    None = refit rolling PCA on all dates (original behaviour).
 
     Returns
     -------
@@ -261,52 +275,91 @@ def rolling_pca(
     cols    = changes.columns.tolist()
     N       = len(cols)
 
+    if train_end is not None:
+        n_train = int((dates <= train_end).sum())
+        print(f"  PCA will fit rolling windows up to {train_end.date()} "
+              f"({n_train:,} days), then freeze loadings for test period.")
+
     # Output containers
-    ev_records     = []    # eigenvalues per date
-    ve_records     = []    # variance explained per date
-    stab_records   = []    # eigenvector stability per date
-    score_records  = []    # latest factor score per date
-    resid_records  = []    # last residual per date (X_i at t)
-    r2_records     = []    # R² per date
-    loadings_dict  = {}    # date → eigenvector matrix
-    prev_vecs      = None  # for computing angle stability
+    ev_records     = []
+    ve_records     = []
+    stab_records   = []
+    score_records  = []
+    resid_records  = []
+    r2_records     = []
+    loadings_dict  = {}
+    prev_vecs      = None
+
+    # State for frozen-loadings mode (used after train_end)
+    frozen_pca_res  = None   # last training-period PCA result
+    frozen_cols     = None   # columns used in last training window
 
     n_processed = 0
     for i in range(corr_window, n_dates, step):
         t = dates[i]
 
-        # ── Correlation-window PCA ────────────────────────────────────────────
-        win_corr   = changes.iloc[i - corr_window : i]
-        if win_corr.dropna(axis=1, how="any").shape[1] < k + 1:
-            continue   # not enough instruments
+        # ── Decide whether to refit PCA or use frozen loadings ───────────────
+        past_train_end = (train_end is not None) and (t > train_end)
 
-        # Drop columns with any NaN in this window
-        win_corr_clean = win_corr.dropna(axis=1)
-        if win_corr_clean.shape[1] < k + 1:
-            continue
+        if past_train_end and frozen_pca_res is not None:
+            # FROZEN MODE: apply last training-period PCA to the current window
+            pca_res  = frozen_pca_res
+            win_corr_clean_cols = frozen_cols
+        # ── Correlation-window PCA (or frozen loadings for test period) ─────────
+        win_corr = changes.iloc[i - corr_window : i]
 
-        pca_res = run_pca_on_window(win_corr_clean, k=k)
+        if past_train_end and frozen_pca_res is not None:
+            # FROZEN MODE — reuse last training-period PCA; do not refit.
+            # Apply frozen factor scores to the current residual window only.
+            win_corr_clean = changes.iloc[i - corr_window : i][frozen_cols].dropna(axis=1)
+            pca_res        = frozen_pca_res
+            cos_sims       = [1.0] * k   # loadings unchanged by definition
+        else:
+            # NORMAL MODE — fit a new PCA on the current correlation window.
+            if win_corr.dropna(axis=1, how="any").shape[1] < k + 1:
+                continue
+            win_corr_clean = win_corr.dropna(axis=1)
+            if win_corr_clean.shape[1] < k + 1:
+                continue
 
-        # ── Eigenvector stability (cosine similarity to previous window) ──────
-        # cos θ_j = |v_t,j · v_{t-1,j}| ∈ [0, 1].
-        # A value of 1.0 means the j-th eigenvector didn't rotate at all.
-        # A value near 0 means PC_j has flipped direction — the factor
-        # structure has changed.  We use absolute value because eigenvectors
-        # are defined only up to a sign flip (V and -V span the same subspace).
-        # Low cos_sim → regime feature → regime detector flags as BAD.
-        vecs = pca_res["eigenvectors"]   # (N × k) — may be subset if columns dropped
-        cos_sims = [np.nan] * k
-        if prev_vecs is not None and prev_vecs.shape == vecs.shape:
-            for j in range(k):
-                cos_sims[j] = abs(float(np.dot(vecs[:, j], prev_vecs[:, j])))
-        prev_vecs = vecs.copy()
+            pca_res = run_pca_on_window(win_corr_clean, k=k)
+
+            # Eigenvector stability (cos θ_j = |v_t · v_{t-1}|)
+            vecs = pca_res["eigenvectors"]
+            cos_sims = [np.nan] * k
+            if prev_vecs is not None and prev_vecs.shape == vecs.shape:
+                for j in range(k):
+                    cos_sims[j] = abs(float(np.dot(vecs[:, j], prev_vecs[:, j])))
+            prev_vecs = vecs.copy()
+
+            # Save last training-period PCA so we can freeze it for the test set
+            if train_end is not None and t <= train_end:
+                frozen_pca_res = pca_res
+                frozen_cols    = list(win_corr_clean.columns)
 
         # ── Residual-window extraction ────────────────────────────────────────
-        win_resid = changes.iloc[max(0, i - resid_window) : i][win_corr_clean.columns]
+        # Use whichever columns survived the correlation window (train or frozen).
+        available_cols = list(win_corr_clean.columns) if not past_train_end \
+                         else frozen_cols
+        win_resid = changes.iloc[max(0, i - resid_window) : i][available_cols]
         win_resid = win_resid.dropna(how="all")
-        scores_in_resid = pca_res["factor_scores"].loc[
-            pca_res["factor_scores"].index.isin(win_resid.index)
-        ]
+
+        # Recompute factor scores for the residual window using current/frozen loadings
+        # (the stored pca_res["factor_scores"] covers the corr_window, not resid_window)
+        if len(win_resid) >= 2:
+            scaler = pca_res["scaler"]
+            Z_resid = scaler.transform(win_resid.values)
+            V_k     = pca_res["eigenvectors"]  # (N_clean × k)
+            F_resid = pd.DataFrame(
+                Z_resid @ V_k,
+                index=win_resid.index,
+                columns=[f"PC{j+1}" for j in range(k)],
+            )
+        else:
+            F_resid = pca_res["factor_scores"].loc[
+                pca_res["factor_scores"].index.isin(win_resid.index)
+            ]
+        scores_in_resid = F_resid
 
         resid_daily, cumresid, betas_df, r2 = extract_residuals(
             win_resid, scores_in_resid

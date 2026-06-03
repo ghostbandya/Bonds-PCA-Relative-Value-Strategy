@@ -233,10 +233,18 @@ def classify_hmm(
     random_state: int   = 42,
     feature_cols: list  = None,
     normalize:    bool  = True,
+    train_end:    "pd.Timestamp | None" = None,
 ) -> tuple[pd.Series, pd.DataFrame, object]:
     """
     Fit a Gaussian HMM on the stability features and decode the most likely
     state sequence.
+
+    IMPORTANT — train_end prevents look-ahead bias in the regime model:
+    If train_end is provided, the HMM is fitted ONLY on features up to that
+    date (the training split), then applied forward to predict regime labels
+    for the full period including the test split. Without this, the HMM
+    parameters are influenced by future data, giving the regime filter an
+    unfair advantage over the test period.
 
     States are relabelled so that:
       state with highest mean cum_var → regime 0 (GOOD)
@@ -250,7 +258,10 @@ def classify_hmm(
     n_iter       : EM training iterations
     random_state : reproducibility seed
     feature_cols : subset of feature columns to feed to HMM
-                   (default: all except var_slope_change which is noisy)
+    normalize    : convert features to expanding percentile ranks before fitting
+    train_end    : last date of training split; HMM is fitted on data up to
+                   this date only, then applied forward. None = use all data
+                   (backward-compatible but leaks future info into HMM params).
 
     Returns
     -------
@@ -274,10 +285,9 @@ def classify_hmm(
         # on absolute values.  Percentile ranks expose *relative* variation
         # and let the HMM find genuine structural regimes.
         feat_input = normalize_features_percentile(feat_input).dropna()
-        # Re-align index with features (dropna may shorten)
         feat_input = feat_input.loc[feat_input.index.intersection(features.index)]
 
-    X = feat_input[feature_cols].values.astype(float)
+    X_all = feat_input[feature_cols].values.astype(float)
 
     model = GaussianHMM(
         n_components=n_states,
@@ -286,13 +296,31 @@ def classify_hmm(
         random_state=random_state,
         verbose=False,
     )
-    model.fit(X)
 
-    # Viterbi decoding — most likely state sequence
-    raw_states = model.predict(X)
+    # Fit on training data only to avoid leaking test-period information
+    # into the HMM's transition matrix and emission parameters.
+    if train_end is not None:
+        train_mask = feat_input.index <= train_end
+        X_train    = feat_input.loc[train_mask, feature_cols].values.astype(float)
+        if len(X_train) < 50:
+            print("  [WARN] Training split too short for HMM — fitting on full data")
+            model.fit(X_all)
+        else:
+            model.fit(X_train)
+            n_train = int(train_mask.sum())
+            n_total = len(feat_input)
+            print(f"  HMM fitted on TRAIN only ({n_train:,} days). "
+                  f"Predicting forward on full period ({n_total:,} days).")
+    else:
+        print("  [WARN] No train_end provided — HMM fitted on full dataset "
+              "(includes test period). Set train_end to avoid look-ahead bias.")
+        model.fit(X_all)
+
+    # Viterbi decoding — apply the (train-only fitted) model to ALL dates
+    raw_states = model.predict(X_all)
 
     # Posterior probabilities
-    log_proba   = model.predict_proba(X)
+    log_proba   = model.predict_proba(X_all)
     proba_df    = pd.DataFrame(
         log_proba,
         index   = feat_input.index,
@@ -342,6 +370,7 @@ def detect_regimes(
     smooth_window: int  = 21,
     thresholds:    dict = None,
     hmm_feature_cols: list = None,
+    train_end:     "pd.Timestamp | None" = None,
 ) -> dict:
     """
     End-to-end regime detection from PCA results.
@@ -353,6 +382,10 @@ def detect_regimes(
     smooth_window : rolling median window for feature smoothing
     thresholds    : custom thresholds for rule-based method
     hmm_feature_cols : custom feature subset for HMM
+    train_end     : last date of the training split. When provided, the HMM
+                    is fitted only on data up to this date (avoiding look-ahead
+                    bias), then applied forward to predict the full period.
+                    Should be set to get_train_end(pca_results["residuals"].index).
 
     Returns
     -------
@@ -364,6 +397,7 @@ def detect_regimes(
       'model'         : fitted HMM object (HMM only; else None)
       'method'        : str — which method was used
       'stats'         : dict — regime frequency counts and durations
+      'train_end'     : pd.Timestamp — the training cutoff used
     """
     print(f"  Building stability features (smooth_window={smooth_window}) …")
     features = build_stability_features(pca_results, smooth_window=smooth_window)
@@ -381,6 +415,7 @@ def detect_regimes(
         regime, regime_proba, model = classify_hmm(
             features,
             feature_cols=hmm_feature_cols,
+            train_end=train_end,
         )
     else:
         raise ValueError(f"method must be 'rules' or 'hmm', got '{method}'")
@@ -408,6 +443,7 @@ def detect_regimes(
         "regime_proba": regime_proba,
         "model":        model,
         "method":       method,
+        "train_end":    train_end,
         "stats":        stats,
     }
 

@@ -119,10 +119,10 @@ def extract_front_month_futures(
 
 def clean_yields(
     df: pd.DataFrame,
-    start: str = "2000-01-01",
+    start: str = "1990-01-01",
     end:   str = None,
     max_gap_fill: int = 5,
-    min_coverage: float = 0.7,
+    min_coverage: float = 0.5,
 ) -> pd.DataFrame:
     """
     Clean raw yield levels.

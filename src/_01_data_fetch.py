@@ -34,7 +34,7 @@ BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 YIELD_DIR = os.path.join(BASE_DIR, "data", "yields")
 os.makedirs(YIELD_DIR, exist_ok=True)
 
-DEFAULT_START = "2000-01-01"
+DEFAULT_START = "1990-01-01"
 DEFAULT_END   = datetime.today().strftime("%Y-%m-%d")
 
 # The seven common tenors fetched from ALL countries.

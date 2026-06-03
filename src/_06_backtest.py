@@ -315,3 +315,379 @@ def run_backtest(
         "pnl_portfolio":  pnl_port,
         "metrics":        metrics,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKTEST V2 — Methods 1 / 2 / 3 + vol-targeting + no-trade band
+#  Adapted from Jay's backtest engine for multi-country universe
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_backtest_v2(
+    pca_results:    dict,
+    signal_dict:    dict,
+    yields_clean:   "pd.DataFrame",
+    yield_changes:  "pd.DataFrame",
+    regime_dict:    dict,
+    config:         "StrategyConfig" = None,
+    save:           bool = True,
+    out_subdir:     str  = "backtest_v2",
+) -> dict:
+    """
+    Full backtest using Methods 1/2/3 portfolio construction + vol-targeting
+    + no-trade band + proper DV01-based costs.
+
+    This is the multi-country adaptation of Jay's backtest pipeline.
+
+    How it differs from run_backtest (v1):
+    ──────────────────────────────────────
+    v1: Uses binary ±1/±0 positions from S-score thresholds.
+        P&L = -DV01_BASE (constant 8.60) × position × Δresidual
+    v2: Computes a continuous yield-space book g_t via Method 1/2/3.
+        P&L = g_t · Δy_t  (dot product over all instruments)
+        Costs via DV01_bp half-spread model.
+        Vol-targeting scales the book daily.
+        No-trade band reduces turnover.
+
+    Parameters
+    ----------
+    pca_results   : dict from rolling_pca() — must include 'residuals', 'loadings'
+    signal_dict   : dict from run_signals() — must include 's_scores'
+    yields_clean  : MultiIndex DataFrame of yield levels (for DV01 computation)
+    yield_changes : flat-column DataFrame of daily yield changes (COUNTRY_TENOR)
+    regime_dict   : dict from detect_regimes()
+    config        : StrategyConfig; defaults to StrategyConfig() (Method 3, LW)
+    save          : save outputs to disk
+    out_subdir    : subdirectory under outputs/
+
+    Returns
+    -------
+    dict: pnl_instrument, pnl_portfolio, metrics, book_g, hold_mask
+    """
+    from .config import StrategyConfig, get_split_dates, TRADE_COUNTRIES
+    from .covariance import estimate_cov, build_rolling_cov
+    from .dv01 import build_dv01_matrix, get_dv01_row
+    from .weights import (method1_geometric, method2_minvar, method3_meanvar,
+                          calibrate_gamma, vol_scale, projection_matrix)
+    from .costs import compute_daily_costs
+    from .rebalance import apply_no_trade_band
+
+    if config is None:
+        config = StrategyConfig()
+
+    print("=" * 60)
+    print(f"  Backtest V2 — Method {config.method} | Cov: {config.covariance} "
+          f"| Band: {config.no_trade_band} | Vol-target: {config.vol_target}")
+    print("=" * 60)
+
+    # ── 1. Align instruments ────────────────────────────────────────────────
+    residuals  = pca_results["residuals"]
+    s_scores   = signal_dict["s_scores"]
+    regime     = regime_dict["regime"]
+
+    # Filter to tradeable instruments
+    trade_cols = [c for c in residuals.columns
+                  if c.split("_")[0] in config.trade_countries]
+    residuals  = residuals[trade_cols]
+    s_scores   = s_scores.reindex(columns=trade_cols)
+
+    # Align yield changes to same columns
+    yc = yield_changes.copy()
+    if isinstance(yc.columns, pd.MultiIndex):
+        yc.columns = [f"{c}_{t}" for c, t in yc.columns]
+    trade_yc = yc[[c for c in trade_cols if c in yc.columns]]
+
+    common_dates = (residuals.index
+                    .intersection(s_scores.index)
+                    .intersection(regime.index)
+                    .intersection(trade_yc.index))
+    common_dates = common_dates.sort_values()
+
+    residuals = residuals.loc[common_dates]
+    s_scores  = s_scores.loc[common_dates]
+    trade_yc  = trade_yc.loc[common_dates]
+    N         = len(trade_cols)
+
+    # ── 2. Train/Val/Test split ─────────────────────────────────────────────
+    splits = get_split_dates(common_dates)
+    train_end = splits["train"][1]
+    print(f"\n  Split: Train → {splits['train'][1].date()} | "
+          f"Val → {splits['val'][1].date()} | "
+          f"Test → {splits['test'][1].date()}")
+
+    # ── 3. Build DV01 matrix ────────────────────────────────────────────────
+    print("\n[1] Building DV01 matrix ...")
+    dv01_matrix = build_dv01_matrix(yields_clean, columns=trade_cols)
+    dv01_matrix = dv01_matrix.reindex(common_dates, method="ffill")
+    print(f"    DV01 matrix: {dv01_matrix.shape}")
+
+    # ── 4. Rolling covariance matrices ─────────────────────────────────────
+    print(f"\n[2] Building rolling covariance ({config.covariance}, "
+          f"window={config.pca_window}) ...")
+    sigma_dict = build_rolling_cov(
+        trade_yc, window=config.pca_window, method=config.cov_method)
+    print(f"    Covariance available from: "
+          f"{min(sigma_dict.keys()).date() if sigma_dict else 'N/A'}")
+
+    # ── 5. Rolling PCA loadings ─────────────────────────────────────────────
+    # Use saved loadings from pca_results if available; otherwise re-derive
+    # from the factor_scores + residuals relationship.
+    loadings_dict = pca_results.get("loadings", {})
+    # Build V_dict: date -> (k, N) array for tradeable instruments only
+    V_dict = {}
+    for date, beta_df in loadings_dict.items():
+        if date not in common_dates:
+            continue
+        # beta_df columns = PC1..PCk, index = instruments
+        available = [c for c in trade_cols if c in beta_df.index]
+        if len(available) < N:
+            continue
+        V = beta_df.loc[available].values.T  # (k, N)
+        V_dict[date] = V
+
+    print(f"    Loadings available for {len(V_dict)} dates")
+
+    # ── 6. Calibrate gamma (Method 3 only) ─────────────────────────────────
+    gamma = config.gamma
+    if config.method == 3 and gamma is None:
+        print("\n[3] Calibrating gamma on TRAIN split ...")
+        train_mask = common_dates <= train_end
+        train_dates = common_dates[train_mask]
+        if len(train_dates) > 100 and len(sigma_dict) > 0:
+            # Use mean Sigma and mean V over training period for calibration
+            sig_train = np.mean([sigma_dict[d] for d in train_dates
+                                  if d in sigma_dict], axis=0)
+            V_train = np.mean([V_dict[d] for d in train_dates
+                               if d in V_dict], axis=0) if V_dict else None
+            if V_train is not None and sig_train is not None:
+                gamma = calibrate_gamma(
+                    trade_yc.loc[train_dates],
+                    V_train,
+                    s_scores.loc[train_dates],
+                    sig_train,
+                )
+                print(f"    Calibrated gamma = {gamma:.3f}")
+            else:
+                gamma = 500.0
+                print(f"    Insufficient data for calibration; using gamma = {gamma}")
+        else:
+            gamma = 500.0
+            print(f"    Using default gamma = {gamma}")
+
+    # ── 7. Build daily portfolio book g_t ───────────────────────────────────
+    print(f"\n[4] Computing Method-{config.method} portfolio book ...")
+
+    # Get a representative V for dates without loadings (use nearest prior)
+    # Fallback V: identity projection (no factor hedge) — should rarely be used
+    V_fallback = np.zeros((3, N))
+    Sigma_fallback = np.eye(N) * 1e-4
+
+    book_g = pd.DataFrame(0.0, index=common_dates, columns=trade_cols)
+
+    for date in common_dates:
+        s_row = s_scores.loc[date].values
+        if np.all(np.isnan(s_row)):
+            continue
+
+        # Regime filter
+        r = regime.loc[date] if date in regime.index else 0
+        if r == 2:  # BAD: flat
+            continue
+
+        size = 1.0 if r == 0 else 0.5  # NEUTRAL: half size
+
+        # Get loadings and covariance for this date
+        V     = V_dict.get(date, V_fallback)
+        Sigma = sigma_dict.get(date, Sigma_fallback)
+
+        if config.method == 1:
+            g = method1_geometric(s_row, V)
+        elif config.method == 2:
+            g = method2_minvar(s_row, V, Sigma)
+        else:  # method 3
+            g = method3_meanvar(s_row, V, Sigma, gamma=gamma)
+
+        book_g.loc[date] = g * size
+
+    print(f"    Book non-zero on {(book_g.abs().sum(axis=1) > 0).mean()*100:.1f}% of days")
+
+    # ── 8. Vol-targeting ────────────────────────────────────────────────────
+    if config.vol_target:
+        print("\n[5] Applying vol-targeting ...")
+        # Compute proxy daily returns on unscaled book
+        proxy_ret = (book_g.shift(1) * trade_yc).sum(axis=1).fillna(0)
+        k_t = vol_scale(proxy_ret)
+        # Apply scaling
+        scaled_G = book_g.multiply(k_t, axis=0)
+        print(f"    Avg leverage scalar k_t: {np.nanmean(k_t):.2f} "
+              f"(max: {np.nanmax(k_t):.2f})")
+    else:
+        scaled_G = book_g
+
+    # ── 9. No-trade band ────────────────────────────────────────────────────
+    if config.no_trade_band > 0:
+        print(f"\n[6] Applying no-trade band (tau={config.no_trade_band}) ...")
+        exec_G, hold_mask = apply_no_trade_band(
+            scaled_G, sigma_dict, V_dict, tau=config.no_trade_band)
+        hold_frac = hold_mask.mean() * 100
+        print(f"    Hold fraction: {hold_frac:.1f}%")
+    else:
+        exec_G    = scaled_G
+        hold_mask = pd.Series(False, index=common_dates)
+
+    # ── 10. P&L computation ─────────────────────────────────────────────────
+    print("\n[7] Computing P&L ...")
+    # P&L: g_{t-1} . Δy_t  (previous book × today's yield changes)
+    # Yield changes are in percent; we keep them as-is for return units.
+    pnl_instr = exec_G.shift(1) * trade_yc
+    pnl_instr = pnl_instr.dropna(how="all")
+
+    # Transaction costs
+    costs = compute_daily_costs(
+        exec_G,
+        dv01_matrix,
+        cost_model=config.cost_model,
+        cost_per_contract_usd=config.cost_per_contract_usd,
+        capital_usd=config.capital_usd,
+    )
+    costs = costs.reindex(pnl_instr.index, fill_value=0.0)
+
+    # Portfolio P&L (equal-weight across active instruments)
+    n_active  = (exec_G.shift(1).abs() > 0).sum(axis=1).replace(0, np.nan)
+    daily_ret = pnl_instr.sum(axis=1) / n_active.reindex(pnl_instr.index)
+    daily_ret = daily_ret.fillna(0) - costs.reindex(daily_ret.index, fill_value=0)
+
+    cum_ret  = (1 + daily_ret).cumprod() - 1
+    drawdown = _max_drawdown_series(cum_ret)
+
+    pnl_portfolio = pd.DataFrame({
+        "daily_ret":      daily_ret,
+        "cumulative_ret": cum_ret,
+        "drawdown":       drawdown,
+    })
+
+    # ── 11. Metrics ──────────────────────────────────────────────────────────
+    metrics = compute_metrics(pnl_portfolio, regime=regime_dict.get("regime"))
+
+    print("\n  Performance Summary (V2):")
+    print(metrics.to_string())
+
+    # Per-split metrics
+    for split_name, (s_start, s_end) in splits.items():
+        split_mask = (daily_ret.index >= s_start) & (daily_ret.index <= s_end)
+        sub = pnl_portfolio[split_mask]
+        if len(sub) > 10:
+            m = compute_metrics(sub)
+            print(f"\n  {split_name.upper()} split ({s_start.date()} → {s_end.date()}):")
+            print(f"    Sharpe: {m.loc['Overall','sharpe']:.3f}  "
+                  f"Return: {m.loc['Overall','ann_return_%']:.2f}%  "
+                  f"MaxDD: {m.loc['Overall','max_drawdown_%']:.2f}%")
+
+    # ── 12. Save ─────────────────────────────────────────────────────────────
+    if save:
+        out = os.path.join(OUTPUT_DIR, out_subdir)
+        os.makedirs(out, exist_ok=True)
+        pnl_instr.to_csv(os.path.join(out, "pnl_daily.csv"))
+        pnl_portfolio.to_csv(os.path.join(out, "pnl_total.csv"))
+        metrics.to_csv(os.path.join(out, "metrics.csv"))
+        exec_G.to_csv(os.path.join(out, "book_g.csv"))
+        hold_mask.to_csv(os.path.join(out, "hold_mask.csv"))
+        print(f"\n  Results saved to outputs/{out_subdir}/")
+
+    return {
+        "pnl_instrument":  pnl_instr,
+        "pnl_portfolio":   pnl_portfolio,
+        "metrics":         metrics,
+        "book_g":          exec_G,
+        "hold_mask":       hold_mask,
+        "gamma":           gamma,
+        "splits":          splits,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPLIT-AWARE METRICS — train / val / test reporting
+# ══════════════════════════════════════════════════════════════════════════════
+
+def metrics_by_split(
+    pnl_portfolio: pd.DataFrame,
+    splits: dict,
+    regime: pd.Series = None,
+) -> dict:
+    """
+    Compute performance metrics for each chronological split independently.
+
+    Parameters
+    ----------
+    pnl_portfolio : DataFrame with 'daily_ret' column (from compute_pnl or run_backtest_v2)
+    splits        : dict from get_split_dates() — keys: 'train', 'val', 'test'
+    regime        : optional regime Series for within-split regime conditioning
+
+    Returns
+    -------
+    dict: {'train': metrics_df, 'val': metrics_df, 'test': metrics_df}
+    """
+    result = {}
+    for split_name, (s_start, s_end) in splits.items():
+        mask = (pnl_portfolio.index >= s_start) & (pnl_portfolio.index <= s_end)
+        sub  = pnl_portfolio[mask]
+        if len(sub) < 20:
+            continue
+        sub_regime = regime.loc[mask] if regime is not None else None
+        result[split_name] = compute_metrics(sub, regime=sub_regime)
+    return result
+
+
+def print_strategy_table(all_results: dict, splits: dict) -> None:
+    """
+    Print a unified Training / Test comparison table for all strategies.
+
+    Parameters
+    ----------
+    all_results : dict {strategy_name -> {'pnl_portfolio': DataFrame, ...}}
+    splits      : dict from get_split_dates() — keys: 'train', 'test'
+    """
+    split_names = list(splits.keys())   # ['train', 'test']
+
+    # Header
+    print("\n" + "=" * 72)
+    print("  STRATEGY RESULTS — Training vs Test")
+    print("=" * 72)
+    first_pnl = list(all_results.values())[0]["pnl_portfolio"]
+    for split_name, (s_start, s_end) in splits.items():
+        n_days = int(((first_pnl.index >= s_start) & (first_pnl.index <= s_end)).sum())
+        label  = "TRAINING" if split_name == "train" else "TEST (holdout)"
+        print(f"  {label:<16}: {s_start.date()} → {s_end.date()} ({n_days:,} days)")
+    print(f"\n  HMM regime fitted on TRAINING only → applied forward to TEST")
+    print()
+
+    # Column headers
+    col_labels = ["TRAINING", "TEST"]
+    header = f"  {'Strategy':<24}"
+    for lbl in col_labels:
+        header += f"  {lbl:<22}"
+    print(header)
+    print(f"  {'':<24}" + "  " +
+          "  ".join([f"{'Sharpe':>6} {'MaxDD%':>7} {'Ret%':>6}"] * len(split_names)))
+    print("  " + "-" * 70)
+
+    # Rows
+    for name, res in all_results.items():
+        if "pnl_portfolio" not in res:
+            continue
+        split_metrics = metrics_by_split(res["pnl_portfolio"], splits)
+        row = f"  {name:<24}"
+        for s in split_names:
+            if s not in split_metrics:
+                row += f"  {'N/A':>6} {'N/A':>7} {'N/A':>6}"
+                continue
+            m = split_metrics[s].loc["Overall"]
+            row += (f"  {m['sharpe']:>6.3f} "
+                    f"{m['max_drawdown_%']:>7.2f} "
+                    f"{m['ann_return_%']:>6.2f}")
+        print(row)
+
+    print("=" * 72)
+    print("  Columns: Sharpe | Max Drawdown (%) | Annualised Return (%)")
+    print("  HMM regime model fitted on TRAINING only — no look-ahead bias.")
+    print("  TEST is the honest evaluation — the model never saw this data.")
+    print("=" * 72 + "\n")
