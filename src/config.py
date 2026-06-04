@@ -115,11 +115,17 @@ TEST_FRAC:  float = 0.20
 
 def get_split_dates(index) -> dict[str, tuple]:
     """
-    Return chronological train / test boundary dates for a DatetimeIndex.
+    Return chronological 80/20 train / test boundary dates for a DatetimeIndex.
 
     Returns dict with keys "train" and "test", each a (start, end) tuple.
-    The train end date is the cutoff passed to detect_regimes() so the HMM
-    is fitted on training data only and applied forward to the test period.
+    The train end date is the single boundary passed to rolling_pca() (to
+    freeze PCA loadings) and to detect_regimes() (to fit the HMM on training
+    data only). It is computed ONCE from the raw yield-changes index before
+    any modelling begins and must not be recomputed afterwards.
+
+    Intentionally has no "val" key. We use 80/20, not 60/20/20:
+    hyperparameters are set by economic reasoning, not validation-set search,
+    so a separate validation period adds no value and shrinks training data.
     """
     n       = len(index)
     n_train = int(n * TRAIN_FRAC)

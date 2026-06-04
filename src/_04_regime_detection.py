@@ -297,8 +297,11 @@ def classify_hmm(
         verbose=False,
     )
 
-    # Fit on training data only to avoid leaking test-period information
-    # into the HMM's transition matrix and emission parameters.
+    # Fit the HMM on training data only (features up to train_end).
+    # The transition matrix and emission parameters are estimated entirely from
+    # the training period — they encode what "normal" and "stressed" regimes
+    # look like based on past data. If we fitted on the full dataset the model
+    # would use 2022's stress episode to label 2005, introducing look-ahead bias.
     if train_end is not None:
         train_mask = feat_input.index <= train_end
         X_train    = feat_input.loc[train_mask, feature_cols].values.astype(float)
@@ -316,7 +319,8 @@ def classify_hmm(
               "(includes test period). Set train_end to avoid look-ahead bias.")
         model.fit(X_all)
 
-    # Viterbi decoding — apply the (train-only fitted) model to ALL dates
+    # Viterbi decoding uses the train-fitted parameters to label ALL dates,
+    # including the test period. The model is applied forward, not refitted.
     raw_states = model.predict(X_all)
 
     # Posterior probabilities

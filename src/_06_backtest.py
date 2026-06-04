@@ -407,12 +407,13 @@ def run_backtest_v2(
     trade_yc  = trade_yc.loc[common_dates]
     N         = len(trade_cols)
 
-    # ── 2. Train/Val/Test split ─────────────────────────────────────────────
+    # ── 2. 80/20 train / test split ─────────────────────────────────────────
+    # NOTE: splits are computed here only to get train_end for gamma calibration
+    # reporting; the authoritative split was already set by main.py before PCA.
     splits = get_split_dates(common_dates)
     train_end = splits["train"][1]
     print(f"\n  Split: Train → {splits['train'][1].date()} | "
-          f"Val → {splits['val'][1].date()} | "
-          f"Test → {splits['test'][1].date()}")
+          f"Test  → {splits['test'][1].date()}")
 
     # ── 3. Build DV01 matrix ────────────────────────────────────────────────
     print("\n[1] Building DV01 matrix ...")
@@ -657,7 +658,7 @@ def print_strategy_table(all_results: dict, splits: dict) -> None:
         n_days = int(((first_pnl.index >= s_start) & (first_pnl.index <= s_end)).sum())
         label  = "TRAINING" if split_name == "train" else "TEST (holdout)"
         print(f"  {label:<16}: {s_start.date()} → {s_end.date()} ({n_days:,} days)")
-    print(f"\n  HMM regime fitted on TRAINING only → applied forward to TEST")
+    print(f"  HMM regime fitted on TRAINING only (80%) → applied forward to TEST (20%)")
     print()
 
     # Column headers

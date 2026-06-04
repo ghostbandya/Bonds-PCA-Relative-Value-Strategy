@@ -456,11 +456,13 @@ def compute_z_scores(
                NaN where window is not yet warm.
     """
     if version == "A":
-        # Block-reset cumulative residual
-        # At each refit boundary, reset the cumsum to zero.
-        # This ensures residuals from different PCA models don't mix.
+        # Block-reset cumulative residual (Version A).
+        # At each PCA refit boundary, the cumsum restarts from zero. Without
+        # this, residuals from different PCA vintages (potentially with rotated
+        # eigenvectors) would be accumulated together, mixing signals from
+        # structurally different factor models.
         if refit_dates is None:
-            # Fall back to a single block (standard cumsum)
+            # No refit dates supplied: treat the whole series as one block.
             cum = residuals.cumsum()
         else:
             cum = pd.DataFrame(np.nan, index=residuals.index, columns=residuals.columns)

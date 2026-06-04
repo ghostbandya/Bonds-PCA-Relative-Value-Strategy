@@ -299,6 +299,10 @@ def rolling_pca(
         t = dates[i]
 
         # ── Decide whether to refit PCA or use frozen loadings ───────────────
+        # Once t crosses train_end, the PCA model is frozen. This prevents
+        # test-period yield data from influencing the eigenvectors used to
+        # generate signals — a key no-lookahead requirement. Any date t in the
+        # test period uses the SAME loadings as the last training-period window.
         past_train_end = (train_end is not None) and (t > train_end)
 
         if past_train_end and frozen_pca_res is not None:
@@ -310,7 +314,7 @@ def rolling_pca(
 
         if past_train_end and frozen_pca_res is not None:
             # FROZEN MODE — reuse last training-period PCA; do not refit.
-            # Apply frozen factor scores to the current residual window only.
+            # cos_sims = 1.0 because the eigenvectors haven't changed.
             win_corr_clean = changes.iloc[i - corr_window : i][frozen_cols].dropna(axis=1)
             pca_res        = frozen_pca_res
             cos_sims       = [1.0] * k   # loadings unchanged by definition
@@ -324,7 +328,9 @@ def rolling_pca(
 
             pca_res = run_pca_on_window(win_corr_clean, k=k)
 
-            # Eigenvector stability (cos θ_j = |v_t · v_{t-1}|)
+            # Eigenvector stability: cos θ_j = |v_t · v_{t-1}| ∈ [0, 1].
+            # Near 1 = loadings barely rotated (stable factor structure).
+            # A sudden drop is the key trigger for a BAD regime.
             vecs = pca_res["eigenvectors"]
             cos_sims = [np.nan] * k
             if prev_vecs is not None and prev_vecs.shape == vecs.shape:
@@ -332,7 +338,9 @@ def rolling_pca(
                     cos_sims[j] = abs(float(np.dot(vecs[:, j], prev_vecs[:, j])))
             prev_vecs = vecs.copy()
 
-            # Save last training-period PCA so we can freeze it for the test set
+            # Keep updating frozen_pca_res until train_end is reached.
+            # After train_end, this value is never overwritten, so the last
+            # training-period PCA is carried forward for all test-period dates.
             if train_end is not None and t <= train_end:
                 frozen_pca_res = pca_res
                 frozen_cols    = list(win_corr_clean.columns)

@@ -2,16 +2,20 @@
 main.py
 =======
 Orchestrator — runs the full pipeline end-to-end with a single
-60/20/20 train / validation / test split applied consistently to
-all strategies.
+80/20 train / test split applied consistently to all strategies.
+
+The split is computed ONCE from the raw yield-changes index before
+any modelling, then passed into PCA (to freeze loadings after train
+end) and into the HMM regime detector (to fit only on training data).
+Neither the PCA nor the regime model ever re-uses the full dataset.
 
 Steps
 -----
   1. Fetch multi-country sovereign yields  (01_data_fetch)
   2. Clean & align data                    (02_data_prep)
-  3. Rolling PCA                           (03_rolling_pca)
-  4. Regime detection (3 regimes)          (04_regime_detection)
-  5. Compute train / val / test split dates
+  3. Compute 80/20 train / test split dates (ONCE, before any modelling)
+  4. Rolling PCA — loadings frozen after train_end  (03_rolling_pca)
+  5. Regime detection — HMM fitted on train only    (04_regime_detection)
   6. Signal generation                     (05_signal_generation)
   7. Run all strategies on the same split:
        a. PCA OU S-score   (original threshold approach)
@@ -19,7 +23,7 @@ Steps
        c. PCA Z-score M2   (min-variance KKT)         [--v2 only]
        d. PCA Z-score M3   (mean-variance, LW cov)    [--v2 only]
        e. Carry + Roll-Down
-  8. Print unified train / val / test comparison table
+  8. Print unified train / test comparison table
   9. Visualisations                        (07_visualisation)
 
 Usage
@@ -119,10 +123,13 @@ def main():
 
     print(f"  Input to PCA: {changes.shape[0]} rows x {changes.shape[1]} instruments")
 
-    # ── Step 3: Compute split dates first ───────────────────────────────────
-    # Must happen before rolling PCA so train_end can be passed in to freeze
-    # PCA loadings after the training period ends.
-    print("\n[STEP 3] Computing train / test split ...")
+    # ── Step 3: Compute split dates ONCE — before any modelling ────────────────
+    # The split boundary (train_end) is the only date the models need.
+    # PCA freezes loadings after train_end; HMM fits only on data up to train_end.
+    # We NEVER re-compute splits after PCA or regime detection — doing so would
+    # shift the boundary to a different index length and break the train/test
+    # accounting.
+    print("\n[STEP 3] Computing 80/20 train / test split ...")
     splits    = get_split_dates(changes.index)
     train_end = get_train_end(changes.index)
     for name, (s, e) in splits.items():
@@ -147,8 +154,6 @@ def main():
         train_end=train_end,
     )
     save_regime_results(regime_dict)
-    # Update splits to use PCA residual index (may differ slightly from changes)
-    splits = get_split_dates(pca_results["residuals"].index)
 
     # ── Step 6: Signal generation ───────────────────────────────────────────
     print("\n[STEP 6] Generating signals (full period — signals are causal) ...")

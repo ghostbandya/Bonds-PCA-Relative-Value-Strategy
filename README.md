@@ -1,6 +1,5 @@
 ## PCA-Based Sovereign Bond Mean-Reversion + Carry/Roll-Down
 
-
 ---
 
 ## Table of Contents
@@ -14,7 +13,8 @@
 8. [Output Files](#8-output-files)
 9. [Mathematical Background](#9-mathematical-background)
 10. [Key Design Decisions](#10-key-design-decisions)
-11. [Results Summary](#11-results-summary)
+11. [Test Suite](#11-test-suite)
+12. [Results Summary](#12-results-summary)
 
 ---
 
@@ -32,6 +32,12 @@ Both strategies are filtered by a **3-regime Hidden Markov Model** that classifi
 the market environment as GOOD / NEUTRAL / BAD based on PCA structural stability.
 Positions are sized at full / half / zero accordingly.
 
+The evaluation uses a strict **80/20 train/test split**:
+- The split boundary is computed **once** before any modelling begins.
+- The HMM regime model is **fitted on training data only**, then applied forward to the test period.
+- PCA loadings are **frozen at the training boundary** — the test period uses the last training-period PCA without any refitting on test data.
+- This ensures the test-period results are genuinely out-of-sample.
+
 ---
 
 ## 2. Strategy Logic
@@ -42,7 +48,6 @@ The core insight from **Credit Suisse "PCA Unleashed" (2012):** the entire yield
 across multiple countries can be described by **3 uncorrelated factors** — Level,
 Slope, and Curvature. After projecting out these factors, the remaining
 **idiosyncratic residual** of each bond's yield mean-reverts strongly.
-
 
 **Pipeline:**
 ```
@@ -97,6 +102,11 @@ Features fed to HMM (mapped to expanding percentile ranks before fitting):
 - `r_squared` — mean R² of factor model across all instruments
 - `var_pc1` — fraction of variance in PC1 alone
 
+**No-lookahead guarantee:** the HMM is fitted on training data only
+(`train_end` is passed to `classify_hmm`), then the trained model decodes
+the full sequence including the test period via Viterbi. This means the transition
+matrix and emission parameters are never influenced by future data.
+
 ---
 
 ## 3. Repository Structure
@@ -104,17 +114,34 @@ Features fed to HMM (mapped to expanding percentile ranks before fitting):
 ```
 Applied Quant Macro Strategies/
 │
-├── main.py                     # Orchestrator — runs the full pipeline end-to-end
+├── main.py                      # Orchestrator — full pipeline end-to-end
 │
 ├── src/
-│   ├── _01_data_fetch.py       # Fetch sovereign yields from FRED, ECB, BoE, MoF
-│   ├── _02_data_prep.py        # Clean, align, and build cross-market panel
-│   ├── _03_rolling_pca.py      # Rolling PCA engine (correlation matrix, residuals)
-│   ├── _04_regime_detection.py # 3-regime HMM classifier on PCA stability features
-│   ├── _05_signal_generation.py# OU fitting, S-score computation, position sizing
-│   ├── _06_backtest.py         # P&L engine, transaction costs, performance metrics
-│   ├── _07_visualisation.py    # All plots (yield curves, PCA, regimes, P&L, comparison)
-│   └── _08_carry_signal.py     # Carry + Roll-Down strategy
+│   ├── config.py                # Strategy config, 80/20 split, universe definitions
+│   ├── _01_data_fetch.py        # Fetch sovereign yields (FRED, ECB, BoE, MoF)
+│   ├── _02_data_prep.py         # Clean, align, build cross-market panel
+│   ├── _03_rolling_pca.py       # Rolling PCA engine — loadings frozen at train_end
+│   ├── _04_regime_detection.py  # 3-regime HMM — fitted on training data only
+│   ├── _05_signal_generation.py # OU S-scores and rolling z-scores, position sizing
+│   ├── _06_backtest.py          # P&L engine, transaction costs, performance metrics
+│   ├── _07_visualisation.py     # All plots (yield curves, PCA, regimes, P&L)
+│   ├── _08_carry_signal.py      # Carry + Roll-Down strategy
+│   ├── costs.py                 # Transaction cost models (flat, DV01-bp)
+│   ├── covariance.py            # Covariance estimators (sample, EWMA, Ledoit-Wolf)
+│   ├── dv01.py                  # Duration and DV01 calculations
+│   ├── rebalance.py             # No-trade band rebalancing logic
+│   └── weights.py               # Portfolio construction Methods 1/2/3
+│
+├── tests/
+│   ├── conftest.py              # Shared pytest fixtures
+│   ├── test_config.py           # StrategyConfig validation + 80/20 split tests
+│   ├── test_signal.py           # Z-score causality, no-lookahead, Version A/B
+│   ├── test_regime.py           # HMM train-only fitting, no-lookahead mutation test
+│   ├── test_costs.py            # Flat and DV01-bp cost model tests
+│   ├── test_covariance.py       # Covariance estimator tests
+│   ├── test_dv01.py             # DV01 calculation tests
+│   ├── test_rebalance.py        # No-trade band mechanics
+│   └── test_weights.py          # Methods 1/2/3 factor-neutrality and KKT constraints
 │
 ├── data/
 │   ├── yields/
@@ -130,13 +157,17 @@ Applied Quant Macro Strategies/
 │   └── bond_futures_metadata.csv       # Optional: futures contract metadata
 │
 └── outputs/
-    ├── pca/                    # residuals.csv, factor_scores.csv, var_explained.csv, ...
-    ├── regimes/                # regime.csv, regime_label.csv, features.csv, ...
-    ├── signals/                # s_scores.csv, positions.csv, signals.csv, ou_params.csv
-    ├── backtest/               # pnl_daily.csv, pnl_total.csv, metrics.csv
-    ├── carry/                  # carry_roll.csv, carry_positions.csv, carry_signals.csv
-    ├── carry_backtest/         # carry_pnl_daily.csv, carry_pnl_total.csv, carry_metrics.csv
-    └── plots/                  # All PNG figures
+    ├── pca/          # residuals.csv, factor_scores.csv, var_explained.csv, ...
+    ├── regimes/      # regime.csv, regime_label.csv, regime_proba.csv, features.csv
+    ├── signals/      # s_scores.csv, positions.csv, signals.csv, ou_params.csv
+    ├── backtest/     # pnl_daily.csv, pnl_total.csv, metrics.csv  (OU strategy)
+    ├── backtest_ou/  # same, OU strategy explicit copy
+    ├── backtest_m1/  # Method 1 (geometric) — with --v2 flag
+    ├── backtest_m2/  # Method 2 (min-variance KKT) — with --v2 flag
+    ├── backtest_m3/  # Method 3 (mean-variance) — with --v2 flag
+    ├── carry/        # carry_roll.csv, carry_positions.csv, carry_signals.csv
+    ├── carry_backtest/ # carry_pnl_daily.csv, carry_pnl_total.csv, carry_metrics.csv
+    └── plots/        # All PNG figures
         ├── yield_curves.png
         ├── pca_variance_explained.png
         ├── pca_loadings.png
@@ -177,12 +208,13 @@ requests, openpyxl
 pandas_datareader       # FRED data fetch
 hmmlearn                # Gaussian HMM for regime detection
 matplotlib, seaborn     # Visualisation
+pytest                  # Test suite
 ```
 
 ### Install
 ```bash
 pip install pandas numpy scipy scikit-learn requests openpyxl \
-            pandas_datareader hmmlearn matplotlib seaborn
+            pandas_datareader hmmlearn matplotlib seaborn pytest
 ```
 
 ---
@@ -194,7 +226,7 @@ pip install pandas numpy scipy scikit-learn requests openpyxl \
 python main.py
 ```
 
-### Skip data fetch (use cached CSVs)
+### Skip data fetch (use cached CSVs — recommended after first run)
 ```bash
 python main.py --skip-fetch
 ```
@@ -203,6 +235,16 @@ python main.py --skip-fetch
 ```bash
 python main.py --skip-fetch --no-plots
 ```
+
+### Also run Methods 1/2/3 (Jay's portfolio construction approach)
+```bash
+python main.py --skip-fetch --v2
+```
+
+Methods 1/2/3 differ in how the portfolio book is constructed from z-scores:
+- **M1 (geometric):** single-tenor entry/exit state machine with factor-neutral hedges
+- **M2 (min-variance):** KKT solution that pins the most-dislocated tenor at minimum variance
+- **M3 (mean-variance):** full mean-variance book `Σ⁻¹α / γ`, projected to factor-neutrality
 
 ### Rule-based regimes instead of HMM
 ```bash
@@ -217,17 +259,25 @@ python src/_03_rolling_pca.py --mode cross --k 3 --corr-window 252
 python src/_04_regime_detection.py --method hmm
 ```
 
+### Run test suite
+```bash
+python -m pytest tests/ -v
+```
+
 ### Pipeline flow
 ```
 Step 1  _01_data_fetch.py    → data/yields/*.csv
 Step 2  _02_data_prep.py     → data/yields/yields_clean.csv, yield_changes.csv
-Step 3  _03_rolling_pca.py   → outputs/pca/*.csv
-Step 4  _04_regime_detection → outputs/regimes/*.csv
-Step 5  _05_signal_generation→ outputs/signals/*.csv
-Step 6  _06_backtest.py      → outputs/backtest/*.csv   (PCA strategy)
-Step 7  _08_carry_signal.py  → outputs/carry/*.csv
-Step 7b _06_backtest.py      → outputs/carry_backtest/  (Carry strategy)
-Step 8  _07_visualisation.py → outputs/plots/*.png
+Step 3  Compute 80/20 split  → train_end (single boundary, computed once)
+Step 4  _03_rolling_pca.py   → outputs/pca/*.csv        (loadings frozen at train_end)
+Step 5  _04_regime_detection → outputs/regimes/*.csv    (HMM fitted on train only)
+Step 6  _05_signal_generation→ outputs/signals/*.csv    (causal signals, full period)
+Step 7a _06_backtest.py      → outputs/backtest_ou/     (PCA OU S-score)
+Step 7b _06_backtest.py      → outputs/backtest_m1/2/3/ (Methods 1/2/3, --v2 only)
+Step 7c _08_carry_signal.py  → outputs/carry/           (Carry strategy)
+Step 7d _06_backtest.py      → outputs/carry_backtest/  (Carry backtest)
+Step 8  Print train/test comparison table
+Step 9  _07_visualisation.py → outputs/plots/*.png
 ```
 
 ---
@@ -249,6 +299,10 @@ Step 8  _07_visualisation.py → outputs/plots/*.png
 | `--s-so` | `1.25` | S-score threshold to open short (bond rich) |
 | `--s-sc` | `0.50` | S-score threshold to close short |
 | `--tc` | `0.0002` | Transaction cost per trade (2 bps, one-way) |
+| `--v2` | off | Also run Methods 1/2/3 portfolio construction |
+| `--covariance` | `lw` | Covariance estimator for Methods 1/2/3: `sample`, `ewma`, `lw` |
+| `--z-window` | `63` | Z-score rolling window for Methods 1/2/3 (days) |
+| `--no-trade-band` | `0.0` | No-trade band width τ ∈ [0, 1) for Methods 1/2/3 |
 
 ### Why Japan is excluded from trading
 The Bank of Japan's Yield Curve Control (YCC) policy from 2012 to 2024 pegged
@@ -292,6 +346,8 @@ spurious signals on a yield series that was administratively pegged.
 | `n_days` | Number of trading days in regime/overall |
 
 Metrics are reported for Overall, GOOD, NEUTRAL, and BAD regimes separately.
+The comparison table printed at the end of the pipeline shows TRAINING vs TEST
+results side by side so over-fitting is immediately visible.
 
 ---
 
@@ -318,6 +374,12 @@ $$F = Z \cdot V_k \in \mathbb{R}^{T \times k}$$
 $$\hat{\Delta y}_i = \beta_{i1} F_1 + \beta_{i2} F_2 + \beta_{i3} F_3 \qquad (\text{OLS, no intercept})$$
 $$\varepsilon_i(t) = \Delta y_i(t) - \hat{\Delta y}_i(t) \qquad X_i(t) = \sum_{s \leq t} \varepsilon_i(s)$$
 
+**Frozen loadings for the test period:**
+After the training boundary `train_end`, the PCA model stops refitting. The final
+set of training-period eigenvectors $V_k$ is applied forward to project test-period
+yield changes into factors and extract residuals. This ensures the PCA model has
+zero exposure to future yield data when generating test-period signals.
+
 ### 9.2 Ornstein-Uhlenbeck Model
 
 The cumulated residual $X_i(t)$ is modelled as:
@@ -337,7 +399,22 @@ S-scores are hard-capped at $\pm 5$.
 
 Filter: only trade if $\kappa > 8.4$ (half-life $< 30$ days).
 
-### 9.3 Duration-Neutral P&L
+### 9.3 Rolling Z-Score (Jay's Approach)
+
+An alternative to the OU S-score that is simpler and more robust:
+
+$$z_t^{(A)} = \sum_{s=t_{\text{block}}}^{t} \varepsilon_s \qquad \text{(Version A: block-reset at each PCA refit)}$$
+
+$$z_t^{(B)} = \sum_{s=t-K+1}^{t} \varepsilon_s \qquad \text{(Version B: rolling K-day window)}$$
+
+$$S_t = \frac{z_t - \overline{z}_{t-w:t}}{\text{std}(z_{t-w:t})} \qquad \text{(trailing } w\text{-day z-score)}$$
+
+Version A resets the cumulative sum at each PCA refit boundary. This prevents
+residuals from different PCA vintages (with potentially rotated eigenvectors)
+from being accumulated together. The z-score is then normalised by its own
+trailing mean and standard deviation rather than a model-derived $\sigma_{eq}$.
+
+### 9.4 Duration-Neutral P&L
 
 Bond price sensitivity to yield: $\Delta P_i \approx -\text{DV01}_i \times \Delta y_i$
 
@@ -347,7 +424,7 @@ $$\text{pnl}_i(t) = -\text{DV01}_{base} \times \text{pos}_i(t-1) \times \Delta\v
 This is duration-neutral sizing: a 1 bps residual move contributes equal P&L
 regardless of whether the instrument is a 1Y or a 30Y bond.
 
-### 9.4 Carry + Roll-Down
+### 9.5 Carry + Roll-Down
 
 $$\text{Carry}_i = y_T - y_{2Y} \qquad \text{(yield minus short rate)}$$
 
@@ -358,6 +435,40 @@ $$\text{Score}_i = \frac{\text{Carry}_i + \text{RollDown}_i}{\text{DV01}_i}$$
 ---
 
 ## 10. Key Design Decisions
+
+### Why 80/20 split (not 60/20/20)?
+A validation set (the "20" in 60/20/20) serves as a second tuning set for
+hyperparameter selection across multiple candidate models. Here, the PCA window,
+OU parameters, and regime thresholds are not selected by scanning over
+out-of-sample validation error — they are set by economic reasoning (252-day
+window ≈ 1 year of market memory; 60-day OU window ≈ mean-reversion timescale).
+A third split therefore adds no methodological value and just shrinks the
+training data available to the HMM. The 80/20 split keeps the narrative clean:
+"Trained on 80% of history. Tested on the 20% the model never saw."
+
+### Why compute the split before PCA — and only once?
+The PCA model and the HMM both need to know when training ends so they can stop
+learning from the data at that point. If splits were recomputed after PCA (e.g.
+from the shorter residuals index, which is ~252 days shorter due to warmup), the
+training boundary would silently shift, the HMM would see slightly more data, and
+the test Sharpe would be subtly optimistic. Computing the boundary once from the
+raw yield-changes index and passing `train_end` into every model that needs it
+keeps the accounting exact and reproducible.
+
+### Why freeze PCA loadings for the test period?
+If the PCA refits on test-period yield data, the eigenvectors for 2022 would
+"know" about the rate hike cycle when decomposing earlier dates. Freezing the
+loadings at the training boundary means the test residuals are genuinely
+out-of-sample — they measure how yields deviate from a model estimated
+entirely on past data.
+
+### Why fit the HMM only on training data?
+The HMM transition matrix and emission parameters encode the statistical
+properties of PCA stability regimes. If fitted on the full sample, the model
+"knows" that 2022 was a BAD regime when it is labelling 2005. Training-only
+fitting prevents this look-ahead contamination. The Viterbi decoding step
+(which produces regime labels) is then applied to the full sequence using the
+training-fitted parameters.
 
 ### Why correlation matrix (not covariance)?
 Covariance PCA lets high-volatility tenors dominate PC1 just because they move
@@ -390,16 +501,51 @@ PCA factor would remove exactly what carry tries to capture.
 Cross-market PCA features live in very narrow absolute ranges (e.g. cum_var 0.69–0.84).
 A Gaussian HMM trained on absolute values cannot separate regimes. Converting to
 expanding percentile ranks maps each day to its position in historical distribution,
-giving the HMM well-separated [0,1] inputs.
+giving the HMM well-separated [0,1] inputs. Expanding (not full-sample) percentile
+ranks are causal — they only use information available up to time t.
 
 ---
 
-## 11. Results Summary
+## 11. Test Suite
 
-Based on the latest pipeline run (US, DE, UK, JP; 2000–2026; 28 instruments;
-7 tenors × 4 countries):
+Run with:
+```bash
+python -m pytest tests/ -v
+```
 
-### PCA Mean-Reversion Strategy (23 tradeable instruments: US + DE + UK)
+89 tests across 8 files. Key test categories:
+
+| File | Tests | What is verified |
+|---|---|---|
+| `test_config.py` | 27 | `StrategyConfig` frozen/hashable/validation; `get_split_dates` returns only `train`/`test` keys; 80/20 fractions exact; no overlap/gap |
+| `test_signal.py` | 11 | Version A reset values (not just shape); Version B rolling sum formula; trailing z-score causality; **mutation no-lookahead test** |
+| `test_regime.py` | 6 | HMM fitted on train only; **mutation test**: perturbing test-period features leaves HMM params unchanged; percentile norm stays in [0,1] |
+| `test_weights.py` | 13 | M1 factor-neutrality, L1 norm; M2 KKT constraints, min-variance proof; M3 gamma scaling |
+| `test_costs.py` | 6 | Flat and DV01-bp cost models |
+| `test_dv01.py` | 11 | Par-bond and zero-coupon DV01; ZIRP guard; monotonicity |
+| `test_covariance.py` | 8 | Sample/EWMA/LW shape/symmetry/PSD; shrinkage bounds |
+| `test_rebalance.py` | 4 | No-trade band identity (τ=0) and hold triggering (high τ) |
+
+### No-lookahead tests (adapted from Jay's test suite)
+
+The mutation no-lookahead tests in `test_signal.py` and `test_regime.py` are
+the strongest causality checks. They:
+1. Compute outputs on the original data.
+2. Perturb values strictly *after* a probe date `t` (same index, different values).
+3. Assert that outputs at `t` and earlier are byte-for-byte unchanged.
+
+This rules out any implicit dependency on future data — window-based operations,
+expanding statistics, or HMM fitting — that an append-only test might miss.
+
+---
+
+## 12. Results Summary
+
+Based on the latest pipeline run (US, DE, UK, JP; ~2004–2026; 28 instruments;
+7 tenors × 4 countries). The HMM was fitted on 80% of the data (training period)
+and applied forward to the held-out 20% (test period).
+
+### PCA Mean-Reversion Strategy (21 tradeable instruments: US + DE + UK)
 
 | Regime | Sharpe | Ann Return | Ann Vol | Max Drawdown |
 |---|---|---|---|---|
@@ -424,5 +570,6 @@ Based on the latest pipeline run (US, DE, UK, JP; 2000–2026; 28 instruments;
 - BAD regime is effectively flat for both (regime filter does its job)
 - The GOOD Sharpe is the most meaningful metric: it measures alpha in the environment
   the strategy is designed for
+- **The test Sharpe is the honest number** — it covers the 20% the model never saw
 
 ---
