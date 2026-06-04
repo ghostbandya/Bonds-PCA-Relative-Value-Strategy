@@ -12,9 +12,7 @@
 7. [Key Parameters](#7-key-parameters)
 8. [Output Files](#8-output-files)
 9. [Mathematical Background](#9-mathematical-background)
-10. [Key Design Decisions](#10-key-design-decisions)
-11. [Test Suite](#11-test-suite)
-12. [Results Summary](#12-results-summary)
+10. [Results Summary](#12-results-summary)
 
 ---
 
