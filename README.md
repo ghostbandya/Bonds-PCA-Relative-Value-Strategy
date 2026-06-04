@@ -236,7 +236,7 @@ python main.py --skip-fetch
 python main.py --skip-fetch --no-plots
 ```
 
-### Also run Methods 1/2/3 (Jay's portfolio construction approach)
+### Also run Methods 1/2/3 
 ```bash
 python main.py --skip-fetch --v2
 ```
@@ -434,112 +434,7 @@ $$\text{Score}_i = \frac{\text{Carry}_i + \text{RollDown}_i}{\text{DV01}_i}$$
 
 ---
 
-## 10. Key Design Decisions
-
-### Why 80/20 split (not 60/20/20)?
-A validation set (the "20" in 60/20/20) serves as a second tuning set for
-hyperparameter selection across multiple candidate models. Here, the PCA window,
-OU parameters, and regime thresholds are not selected by scanning over
-out-of-sample validation error — they are set by economic reasoning (252-day
-window ≈ 1 year of market memory; 60-day OU window ≈ mean-reversion timescale).
-A third split therefore adds no methodological value and just shrinks the
-training data available to the HMM. The 80/20 split keeps the narrative clean:
-"Trained on 80% of history. Tested on the 20% the model never saw."
-
-### Why compute the split before PCA — and only once?
-The PCA model and the HMM both need to know when training ends so they can stop
-learning from the data at that point. If splits were recomputed after PCA (e.g.
-from the shorter residuals index, which is ~252 days shorter due to warmup), the
-training boundary would silently shift, the HMM would see slightly more data, and
-the test Sharpe would be subtly optimistic. Computing the boundary once from the
-raw yield-changes index and passing `train_end` into every model that needs it
-keeps the accounting exact and reproducible.
-
-### Why freeze PCA loadings for the test period?
-If the PCA refits on test-period yield data, the eigenvectors for 2022 would
-"know" about the rate hike cycle when decomposing earlier dates. Freezing the
-loadings at the training boundary means the test residuals are genuinely
-out-of-sample — they measure how yields deviate from a model estimated
-entirely on past data.
-
-### Why fit the HMM only on training data?
-The HMM transition matrix and emission parameters encode the statistical
-properties of PCA stability regimes. If fitted on the full sample, the model
-"knows" that 2022 was a BAD regime when it is labelling 2005. Training-only
-fitting prevents this look-ahead contamination. The Viterbi decoding step
-(which produces regime labels) is then applied to the full sequence using the
-training-fitted parameters.
-
-### Why correlation matrix (not covariance)?
-Covariance PCA lets high-volatility tenors dominate PC1 just because they move
-more in absolute bps. We want PC1 to represent a structural parallel shift, not
-volatility-dominated variance. Standardising first gives each tenor equal weight.
-
-### Why rolling 252-day window?
-The covariance structure of yields changes over time (2008, 2020, 2022 were very
-different). A static full-sample PCA uses stale loadings. Rolling 252 days (~1 year)
-keeps the model current while using enough data for stable covariance estimation.
-
-### Why 60-day inner window for OU?
-60 days is short enough to reflect current mean-reversion speed (not 1-year-old
-dynamics) but long enough for OLS to estimate the AR(1) reliably (minimum ~30 obs).
-
-### Why exclude Japan from trading?
-BoJ Yield Curve Control (2012–2024) suppressed JGB yield mean-reversion. JP stays
-in the PCA to improve global factor estimation but is excluded from signal generation.
-
-### Why factor-neutral P&L for PCA (not raw yield changes)?
-Using daily diffs of cumulated residuals as the P&L driver removes all systematic
-factor moves (PC1/PC2/PC3) from P&L. Only the idiosyncratic spread reversion counts.
-This gives a true measure of the strategy's alpha.
-
-### Why raw yield changes for carry (not residuals)?
-Carry is the systematic level signal — it IS PC1 in a sense. Subtracting out the
-PCA factor would remove exactly what carry tries to capture.
-
-### Why percentile normalisation before HMM?
-Cross-market PCA features live in very narrow absolute ranges (e.g. cum_var 0.69–0.84).
-A Gaussian HMM trained on absolute values cannot separate regimes. Converting to
-expanding percentile ranks maps each day to its position in historical distribution,
-giving the HMM well-separated [0,1] inputs. Expanding (not full-sample) percentile
-ranks are causal — they only use information available up to time t.
-
----
-
-## 11. Test Suite
-
-Run with:
-```bash
-python -m pytest tests/ -v
-```
-
-89 tests across 8 files. Key test categories:
-
-| File | Tests | What is verified |
-|---|---|---|
-| `test_config.py` | 27 | `StrategyConfig` frozen/hashable/validation; `get_split_dates` returns only `train`/`test` keys; 80/20 fractions exact; no overlap/gap |
-| `test_signal.py` | 11 | Version A reset values (not just shape); Version B rolling sum formula; trailing z-score causality; **mutation no-lookahead test** |
-| `test_regime.py` | 6 | HMM fitted on train only; **mutation test**: perturbing test-period features leaves HMM params unchanged; percentile norm stays in [0,1] |
-| `test_weights.py` | 13 | M1 factor-neutrality, L1 norm; M2 KKT constraints, min-variance proof; M3 gamma scaling |
-| `test_costs.py` | 6 | Flat and DV01-bp cost models |
-| `test_dv01.py` | 11 | Par-bond and zero-coupon DV01; ZIRP guard; monotonicity |
-| `test_covariance.py` | 8 | Sample/EWMA/LW shape/symmetry/PSD; shrinkage bounds |
-| `test_rebalance.py` | 4 | No-trade band identity (τ=0) and hold triggering (high τ) |
-
-### No-lookahead tests (adapted from Jay's test suite)
-
-The mutation no-lookahead tests in `test_signal.py` and `test_regime.py` are
-the strongest causality checks. They:
-1. Compute outputs on the original data.
-2. Perturb values strictly *after* a probe date `t` (same index, different values).
-3. Assert that outputs at `t` and earlier are byte-for-byte unchanged.
-
-This rules out any implicit dependency on future data — window-based operations,
-expanding statistics, or HMM fitting — that an append-only test might miss.
-
----
-
-## 12. Results Summary
+## 10. Results Summary
 
 Based on the latest pipeline run (US, DE, UK, JP; ~2004–2026; 28 instruments;
 7 tenors × 4 countries). The HMM was fitted on 80% of the data (training period)
